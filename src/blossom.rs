@@ -53,8 +53,25 @@ pub struct FriendGrant {
     pub grant_id: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerMetadata {
+    pub name: String,
+    pub software: String,
+}
+
+impl Default for ServerMetadata {
+    fn default() -> Self {
+        Self {
+            name: "Shelter Kit".into(),
+            software: "https://github.com/forgesworn/shelter-kit".into(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct BlossomConfig {
+    /// Product identity reported by the BUD-01 server information endpoint.
+    pub server_metadata: ServerMetadata,
     pub public_base_url: Url,
     pub accepted_server_names: Vec<String>,
     /// Nostr public keys permitted to upload, mirror and delete blobs.
@@ -79,6 +96,7 @@ pub struct AppState {
 
 struct InnerState {
     store: Store,
+    server_metadata: ServerMetadata,
     public_base_url: Url,
     trusted_auth: AuthPolicy,
     public_auth: AuthPolicy,
@@ -96,6 +114,8 @@ struct StoragePolicy {
 
 #[derive(Debug, thiserror::Error)]
 pub enum BlossomConfigError {
+    #[error("server metadata requires a bounded name and an HTTPS software URL")]
+    InvalidServerMetadata,
     #[error("allowed writer public keys must be 64 lower-case hexadecimal characters")]
     InvalidWriterPubkey,
     #[error("maximum concurrent writes must be greater than zero")]
@@ -131,8 +151,8 @@ pub enum RepairError {
 
 #[derive(Debug, Serialize)]
 struct ServerInfo {
-    name: &'static str,
-    software: &'static str,
+    name: String,
+    software: String,
     version: &'static str,
     blossom: [&'static str; 6],
 }
@@ -266,6 +286,9 @@ impl AppState {
         config: BlossomConfig,
         fetcher: Option<Arc<dyn BlobFetcher>>,
     ) -> Result<Self, BlossomConfigError> {
+        if !valid_server_metadata(&config.server_metadata) {
+            return Err(BlossomConfigError::InvalidServerMetadata);
+        }
         if config
             .allowed_pubkeys
             .iter()
@@ -309,6 +332,7 @@ impl AppState {
         Ok(Self {
             inner: Arc::new(InnerState {
                 store,
+                server_metadata: config.server_metadata,
                 public_base_url: config.public_base_url,
                 trusted_auth,
                 public_auth,
@@ -485,13 +509,32 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-async fn server_info() -> Json<ServerInfo> {
+async fn server_info(State(state): State<AppState>) -> Json<ServerInfo> {
     Json(ServerInfo {
-        name: "Shelter Kit",
-        software: "https://github.com/forgesworn/shelter-kit",
+        name: state.inner.server_metadata.name.clone(),
+        software: state.inner.server_metadata.software.clone(),
         version: env!("CARGO_PKG_VERSION"),
         blossom: ["BUD-01", "BUD-02", "BUD-04", "BUD-06", "BUD-11", "BUD-12"],
     })
+}
+
+fn valid_server_metadata(metadata: &ServerMetadata) -> bool {
+    if metadata.name.is_empty()
+        || metadata.name.len() > 128
+        || metadata.name.chars().any(char::is_control)
+        || metadata.software.len() > 2048
+    {
+        return false;
+    }
+    let Ok(software) = Url::parse(&metadata.software) else {
+        return false;
+    };
+    software.scheme() == "https"
+        && software.host_str().is_some()
+        && software.username().is_empty()
+        && software.password().is_none()
+        && software.query().is_none()
+        && software.fragment().is_none()
 }
 
 async fn health(State(state): State<AppState>) -> Result<Json<HealthResponse>, ApiError> {
@@ -1410,6 +1453,7 @@ mod tests {
             AppState::new(
                 store,
                 BlossomConfig {
+                    server_metadata: ServerMetadata::default(),
                     public_base_url: Url::parse("http://node.example/").unwrap(),
                     accepted_server_names: vec!["node.example".into()],
                     allowed_pubkeys: vec![
@@ -1597,6 +1641,7 @@ mod tests {
 
     fn test_config() -> BlossomConfig {
         BlossomConfig {
+            server_metadata: ServerMetadata::default(),
             public_base_url: Url::parse("http://node.example/").unwrap(),
             accepted_server_names: vec!["node.example".into()],
             allowed_pubkeys: vec![
@@ -1607,6 +1652,38 @@ mod tests {
             max_concurrent_writes: 4,
             mirror_proxy: None,
         }
+    }
+
+    #[tokio::test]
+    async fn server_information_uses_the_shell_identity() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = test_config();
+        config.server_metadata = ServerMetadata {
+            name: "Example Keeper".into(),
+            software: "https://example.com/keeper".into(),
+        };
+        let app = router(AppState::new(open_store(&directory), config).unwrap());
+        let response = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let info: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(info["name"], "Example Keeper");
+        assert_eq!(info["software"], "https://example.com/keeper");
+    }
+
+    #[test]
+    fn server_information_refuses_unsafe_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = test_config();
+        config.server_metadata.name = "bad\nname".into();
+        let result = AppState::new(open_store(&directory), config);
+        assert!(matches!(
+            result,
+            Err(BlossomConfigError::InvalidServerMetadata)
+        ));
     }
 
     fn mirror_request(hash: &str, now: u64) -> Request<Body> {

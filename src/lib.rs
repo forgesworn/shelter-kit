@@ -6,7 +6,8 @@ pub mod fetch;
 pub mod store;
 
 pub use blossom::{
-    AppState, BlossomConfig, BlossomConfigError, FriendGrant, RepairError, RepairReport, router,
+    AppState, BlossomConfig, BlossomConfigError, FriendGrant, RepairError, RepairReport,
+    ServerMetadata, router,
 };
 pub use fetch::{
     BlobFetcher, FetchConfigError, FetchError, FetchPath, FetchRequest, FetchedBlob, TorHttpFetcher,

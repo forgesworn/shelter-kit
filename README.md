@@ -45,8 +45,10 @@ shelter-kit = { git = "https://github.com/forgesworn/shelter-kit", tag = "v0.1.0
 
 Create a `Store`, build an `AppState` from a `BlossomConfig`, optionally supply
 a `BlobFetcher`, then mount `shelter_kit::router(state)` into the product's
-listener.  Tor is included as the first fetch adapter; an application may
-provide another adapter without moving trust decisions into that transport.
+listener.  The config carries the shell's public product name and HTTPS source
+URL, so shared storage does not blur the Wildbloom/Bothy front doors.  Tor is
+included as the first fetch adapter; an application may provide another adapter
+without moving trust decisions into that transport.
 
 ## Status
 
