@@ -28,9 +28,7 @@ top of `shelter-kit` `CORE-CONTRACT.md` 0.1.1. Every item in Bothy's delta
 was answered by Tally on 2026-08-28 11:02 UTC (AGREED, with one scoping
 counter on listing that this text adopts). Normative words: MUST / MUST NOT
 / MAY. The transport half is Tally's; the two halves merge into one
-document beside `shelter-kit`, to be signed by both owners. One item is
-outside both halves and with the owners: who funds the envelope's
-independent cryptographic review and whether it gates Phase 1.*
+document beside `shelter-kit`, to be signed by both owners. The one owner item -- the envelope's review -- is recorded in section E.*
 
 ## 1. Ownership
 
@@ -159,8 +157,7 @@ valid configurations, not degraded states.
 
 The encryption envelope (a separate joint specification: Wildbloom's
 `aes-256-gcm-chunked-v1` construction, key source outside the frame,
-neutral magic and MIME names, three known-answer vectors, one independent
-review); node claim / status events and their kinds; peer
+neutral magic and MIME names, three known-answer vectors, and the review rule recorded in section E); node claim / status events and their kinds; peer
 discovery; replica promises and placement; proof of storage; paid quota;
 the transport half.
 
@@ -226,7 +223,9 @@ cannot fully parse.
 
 The exact byte format and the known-answer vectors are frozen in
 `forgesworn-link` (`link-core` and `vectors/`); this contract pins `FSL-CARD-1`
-by those vectors. The card is what a node's status event carries; publishing it
+by those vectors. A node MUST persist the highest serial it has issued, so that
+a backward clock step cannot mint a fresh card that fails another node's
+replay check on the serial. The card is what a node's status event carries; publishing it
 is the shell's, per the storage half §9.
 
 ## T3. Session interface
@@ -237,13 +236,17 @@ The transport exposes a narrow surface and nothing wider:
 - `open_stream() -> Stream`, `accept_stream() -> Stream`;
 - `close()`;
 - `path() -> PathReport` -- status, relay in use, proved direct address, the
-  cause of the last transition, and since when.
+  cause of the last transition, and since when;
+- `history() -> [PathTransition]` -- the bounded, oldest-first record of path
+  transitions.
 
 A `Session` is one QUIC connection to one authenticated peer; a `Stream` is one
 bidirectional byte stream carrying `AsyncRead + AsyncWrite`. There is no framing
 above QUIC and no knowledge of Blossom in this surface. `path()` MUST report the
 path actually in use, taken from proof, never inferred from a successful
-transfer.
+transfer. The recorded transition history is part of the interface, not only of
+the log: a change too brief to catch by sampling `path()` (a sub-second
+reconnect) MUST still appear in `history()`.
 
 ## T4. Connection state machine
 
@@ -297,7 +300,9 @@ The blob-request wire (`link-blossom`): a request is the magic `FSLB`, a version
 byte and the 32-byte SHA-256; a response is a status byte, then for success the
 `u64` size, the media type, and exactly that many body bytes streamed in chunks
 of at most 64 KiB. A short or over-long stream MUST be treated as truncation and
-refused.
+refused. A `Session` to a node MAY be reused across fetches to that node; the
+contract does not require a QUIC handshake per blob, so a scrub over many blobs
+is not many handshakes.
 
 ## T7. FetchPath is evidence, not authority
 
