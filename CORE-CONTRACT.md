@@ -1,7 +1,7 @@
 # Shelter Kit core contract
 
 This document defines the joint boundary shared by Wildbloom, Bothy and other
-compatible shells.  It describes version 0.1.0 as implemented, not a proposed
+compatible shells.  It describes version 0.1.1 as implemented, not a proposed
 future network.
 
 ## Ownership
@@ -74,7 +74,12 @@ migrate forward without losing blobs or claims.  A change that weakens validatio
 changes retention meaning or requires a destructive migration is a major-version
 change and needs review by both publishing and shelter consumers.
 
-## Explicitly outside 0.1.0
+The supplied direct HTTPS adapter disables redirects and ambient proxies and
+refuses DNS answers in private, loopback, link-local, documentation and other
+non-public address space.  The Tor adapter accepts only an explicit loopback
+`socks5h` proxy.  Choosing either adapter does not change storage authority.
+
+## Explicitly outside 0.1.1
 
 The following are not part of this version's contract: an encryption envelope,
 vault or recovery keys, Nostr node claim/status events, peer discovery,

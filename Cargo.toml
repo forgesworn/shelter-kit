@@ -1,7 +1,7 @@
 [package]
 name = "shelter-kit"
 description = "Transport-neutral Blossom storage, retention and repair core"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 rust-version = "1.88"
 license = "MIT"
@@ -26,7 +26,7 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
 sha2 = "0.10.9"
 thiserror = "2.0.17"
-tokio = { version = "1.48.0", features = ["fs", "io-util", "macros", "rt-multi-thread", "sync", "time"] }
+tokio = { version = "1.48.0", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "sync", "time"] }
 tokio-util = { version = "0.7.17", features = ["io"] }
 tower-http = { version = "0.6.6", features = ["cors"] }
 tracing = "0.1.41"
