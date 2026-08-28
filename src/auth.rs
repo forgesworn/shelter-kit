@@ -1,4 +1,7 @@
-use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use base64::{
+    Engine as _,
+    engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD},
+};
 use nostr::prelude::Event;
 use serde::Deserialize;
 use std::{collections::BTreeSet, time::Duration};
@@ -153,11 +156,17 @@ impl AuthPolicy {
         let encoded = authorization
             .strip_prefix("Nostr ")
             .ok_or(AuthError::Encoding)?;
-        if encoded.is_empty() || encoded.len() > MAX_AUTH_BYTES * 2 || encoded.contains('=') {
+        if encoded.is_empty() || encoded.len() > MAX_AUTH_BYTES * 2 {
             return Err(AuthError::Encoding);
         }
-        let bytes = URL_SAFE_NO_PAD
-            .decode(encoded.as_bytes())
+        // BUD-01 specifies standard base64. Decode leniently so a spec-compliant
+        // client, a url-safe client, and padded or unpadded input all verify;
+        // the alphabets only differ at two characters, so there is no ambiguity.
+        let bytes = STANDARD
+            .decode(encoded)
+            .or_else(|_| STANDARD_NO_PAD.decode(encoded))
+            .or_else(|_| URL_SAFE.decode(encoded))
+            .or_else(|_| URL_SAFE_NO_PAD.decode(encoded))
             .map_err(|_| AuthError::Encoding)?;
         if bytes.len() > MAX_AUTH_BYTES {
             return Err(AuthError::Encoding);
@@ -299,6 +308,22 @@ mod tests {
         format!("Nostr {}", URL_SAFE_NO_PAD.encode(json))
     }
 
+    /// Same event, encoded with standard padded base64 as BUD-01 specifies.
+    fn header_standard(tags: Vec<Vec<String>>, created_at: u64) -> String {
+        let keys = Keys::parse(&format!("{:064x}", 1)).unwrap();
+        let tags = tags
+            .into_iter()
+            .map(|tag| Tag::parse(tag).unwrap())
+            .collect::<Vec<_>>();
+        let event = EventBuilder::new(Kind::Custom(BLOSSOM_AUTH_KIND), "Upload blob")
+            .tags(tags)
+            .custom_created_at(Timestamp::from(created_at))
+            .finalize(&keys)
+            .unwrap();
+        let json = serde_json::to_vec(&event).unwrap();
+        format!("Nostr {}", STANDARD.encode(json))
+    }
+
     fn valid_tags(hash: &str, expiration: u64) -> Vec<Vec<String>> {
         vec![
             vec!["t".into(), "upload".into()],
@@ -321,6 +346,18 @@ mod tests {
             .unwrap();
         assert_eq!(verified.expires_at, 1_120);
         assert_eq!(verified.owner_pubkey.len(), 64);
+    }
+
+    #[test]
+    fn accepts_standard_base64_authorization() {
+        // BUD-01 uses standard base64; a spec-compliant client must verify, not
+        // only a url-safe one.
+        let hash = "a".repeat(64);
+        let auth = header_standard(valid_tags(&hash, 1_120), 1_000);
+        let verified = public_policy()
+            .verify_upload(Some(&auth), &hash, 1_010)
+            .unwrap();
+        assert_eq!(verified.expires_at, 1_120);
     }
 
     #[test]
