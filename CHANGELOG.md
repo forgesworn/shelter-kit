@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.1.1 - 2026-08-28
+
+- Add a direct public-HTTPS mirror and repair adapter.
+- Disable ambient proxies and redirects in direct mode.
+- Filter direct DNS results so hostnames cannot resolve to non-public networks.
+- Keep Tor and direct HTTPS as shell-selected transports over the same router,
+  authorisation and content-addressed store.
+
 ## 0.1.0 - 2026-08-27
 
 - Extract the reviewed Wildbloom Node storage and Blossom core.

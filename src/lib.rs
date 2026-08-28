@@ -10,7 +10,8 @@ pub use blossom::{
     ServerMetadata, router,
 };
 pub use fetch::{
-    BlobFetcher, FetchConfigError, FetchError, FetchPath, FetchRequest, FetchedBlob, TorHttpFetcher,
+    BlobFetcher, DirectHttpsFetcher, FetchConfigError, FetchError, FetchPath, FetchRequest,
+    FetchedBlob, TorHttpFetcher,
 };
 pub use store::{
     BlobMetadata, ClaimMetadata, ClaimSpec, DeleteOutcome, EvictionRecord, IntegrityReport,

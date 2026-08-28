@@ -11,10 +11,11 @@ transport-neutral fetch interface and verified mirror/repair path.
 
 Wildbloom and Bothy remain separate products because publishing and private
 shelter have different consent and failure modes.  They can use the same core:
-a Wildbloom Node is an owner-first keeper using Tor, while Bothy can add its own
-pairing, federation and native transport around the same store and router.
+a Wildbloom Node is an owner-first keeper using Tor or direct HTTPS, while Bothy
+can add its own pairing, federation and native transport around the same store
+and router.
 
-## Implemented in 0.1.0
+## Implemented in 0.1.1
 
 - BUD-01, BUD-02, BUD-04, BUD-06, BUD-11 and self-only BUD-12 routing.
 - Streaming reserve, hash verification and atomic content-addressed storage.
@@ -23,6 +24,8 @@ pairing, federation and native transport around the same store and router.
 - Opaque serving for friend-only and guest-only blobs.
 - A `BlobFetcher` boundary that keeps transport separate from authorisation,
   retention, hashing and storage.
+- Direct public-HTTPS and loopback-proxied Tor fetch adapters, both with
+  redirects disabled.  Direct DNS refuses non-public address space.
 - Verified mirror sources and exact-length, exact-hash repair.
 - SQLite schema migration and interrupted-transaction reconciliation.
 
@@ -40,15 +43,15 @@ moved, not evidence that another machine will retain them.
 
 ```toml
 [dependencies]
-shelter-kit = { git = "https://github.com/forgesworn/shelter-kit", tag = "v0.1.0" }
+shelter-kit = { git = "https://github.com/forgesworn/shelter-kit", tag = "v0.1.1" }
 ```
 
 Create a `Store`, build an `AppState` from a `BlossomConfig`, optionally supply
 a `BlobFetcher`, then mount `shelter_kit::router(state)` into the product's
 listener.  The config carries the shell's public product name and HTTPS source
-URL, so shared storage does not blur the Wildbloom/Bothy front doors.  Tor is
-included as the first fetch adapter; an application may provide another adapter
-without moving trust decisions into that transport.
+URL, so shared storage does not blur the Wildbloom/Bothy front doors.  Tor and
+direct public HTTPS are supplied fetch adapters; an application may provide
+another adapter without moving trust decisions into that transport.
 
 ## Status
 

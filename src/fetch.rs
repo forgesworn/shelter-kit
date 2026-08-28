@@ -10,7 +10,11 @@
 
 use bytes::Bytes;
 use futures_util::{StreamExt, TryStreamExt, future::BoxFuture, stream::BoxStream};
-use std::{fmt, time::Duration};
+use std::{
+    fmt,
+    net::{IpAddr, Ipv4Addr, Ipv6Addr},
+    time::Duration,
+};
 use url::Url;
 
 /// One request for the bytes of a content-addressed blob.
@@ -119,6 +123,144 @@ pub enum FetchConfigError {
     UnsafeProxy,
     #[error("failed to configure the mirror client: {0}")]
     Client(#[from] reqwest::Error),
+}
+
+/// HTTP fetcher for public HTTPS origins without Tor or another proxy.
+///
+/// Redirects and ambient system proxies are disabled.  DNS resolution is
+/// filtered so a public hostname cannot be used to reach loopback, private,
+/// link-local, documentation or other non-public address space.  The router
+/// still validates the hash-addressed URL and independently checks the exact
+/// byte length and SHA-256 delivered by this adapter.
+#[derive(Debug, Clone)]
+pub struct DirectHttpsFetcher {
+    client: reqwest::Client,
+}
+
+impl DirectHttpsFetcher {
+    /// Builds a direct fetcher which accepts only public `https://` origins.
+    pub fn new() -> Result<Self, FetchConfigError> {
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .https_only(true)
+            .dns_resolver(PublicDnsResolver)
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(10 * 60))
+            .user_agent(concat!("shelter-kit/", env!("CARGO_PKG_VERSION")))
+            .build()?;
+        Ok(Self { client })
+    }
+}
+
+impl BlobFetcher for DirectHttpsFetcher {
+    fn fetch(&self, request: FetchRequest) -> BoxFuture<'_, Result<FetchedBlob, FetchError>> {
+        Box::pin(async move {
+            let Some(host) = request.source.host_str() else {
+                return Err(FetchError::UnsupportedSource);
+            };
+            if request.source.scheme() != "https"
+                || host.ends_with(".onion")
+                || host.parse::<IpAddr>().is_ok()
+                || !host.contains('.')
+                || !request.source.username().is_empty()
+                || request.source.password().is_some()
+                || request.source.query().is_some()
+                || request.source.fragment().is_some()
+            {
+                return Err(FetchError::UnsupportedSource);
+            }
+            let response = self
+                .client
+                .get(request.source)
+                .send()
+                .await
+                .map_err(|error| FetchError::Unreachable(error.to_string()))?;
+            let status = response.status();
+            if status != reqwest::StatusCode::OK {
+                return Err(FetchError::UnusableStatus(status.as_u16()));
+            }
+            let size = response.content_length().ok_or(FetchError::MissingLength)?;
+            let content_type = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            let body = response
+                .bytes_stream()
+                .map_err(|error| FetchError::Stream(error.to_string()))
+                .boxed();
+            Ok(FetchedBlob {
+                path: FetchPath::Https,
+                size,
+                content_type,
+                body,
+            })
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PublicDnsResolver;
+
+impl reqwest::dns::Resolve for PublicDnsResolver {
+    fn resolve(&self, name: reqwest::dns::Name) -> reqwest::dns::Resolving {
+        let hostname = name.as_str().to_owned();
+        Box::pin(async move {
+            let resolved = match tokio::net::lookup_host((hostname.as_str(), 0)).await {
+                Ok(resolved) => resolved,
+                Err(error) => {
+                    return Err(Box::new(error) as Box<dyn std::error::Error + Send + Sync>);
+                }
+            };
+            let addresses = resolved
+                .filter(|address| is_public_ip(address.ip()))
+                .collect::<Vec<_>>();
+            if addresses.is_empty() {
+                return Err(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "direct mirror origin did not resolve to a public address",
+                ))
+                    as Box<dyn std::error::Error + Send + Sync>);
+            }
+            Ok(Box::new(addresses.into_iter()) as reqwest::dns::Addrs)
+        })
+    }
+}
+
+fn is_public_ip(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => is_public_ipv4(address),
+        IpAddr::V6(address) => is_public_ipv6(address),
+    }
+}
+
+fn is_public_ipv4(address: Ipv4Addr) -> bool {
+    let [first, second, third, fourth] = address.octets();
+    !(first == 0
+        || first == 10
+        || first == 127
+        || first >= 224
+        || (first == 100 && (64..=127).contains(&second))
+        || (first == 169 && second == 254)
+        || (first == 172 && (16..=31).contains(&second))
+        || (first == 192 && second == 0 && (third == 0 || third == 2))
+        || (first == 192 && second == 88 && third == 99)
+        || (first == 192 && second == 168)
+        || (first == 198 && (second == 18 || second == 19))
+        || (first == 198 && second == 51 && third == 100)
+        || (first == 203 && second == 0 && third == 113)
+        || (first == 255 && second == 255 && third == 255 && fourth == 255))
+}
+
+fn is_public_ipv6(address: Ipv6Addr) -> bool {
+    if let Some(mapped) = address.to_ipv4_mapped() {
+        return is_public_ipv4(mapped);
+    }
+    let segments = address.segments();
+    // Current globally routed unicast space is 2000::/3.  Keep the adapter
+    // conservative and separately reject the documentation prefix.
+    (segments[0] & 0xe000) == 0x2000 && !(segments[0] == 0x2001 && segments[1] == 0x0db8)
 }
 
 /// HTTP fetcher that speaks only through a loopback `socks5h://` proxy.
@@ -240,6 +382,65 @@ mod tests {
             })
             .await;
         assert!(matches!(result, Err(FetchError::UnsupportedSource)));
+    }
+
+    #[tokio::test]
+    async fn direct_fetcher_refuses_non_https_and_onion_sources_before_network_access() {
+        let fetcher = DirectHttpsFetcher::new().unwrap();
+        for source in [
+            "http://public.example/blob",
+            "https://127.0.0.1/blob",
+            "https://localhost/blob",
+            "https://aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.onion/blob",
+        ] {
+            let result = fetcher
+                .fetch(FetchRequest {
+                    source: Url::parse(source).unwrap(),
+                    sha256: "a".repeat(64),
+                    expected_size: None,
+                })
+                .await;
+            assert!(
+                matches!(result, Err(FetchError::UnsupportedSource)),
+                "{source}"
+            );
+        }
+    }
+
+    #[test]
+    fn direct_dns_allows_public_addresses_and_refuses_non_public_ranges() {
+        for address in [
+            "1.1.1.1",
+            "8.8.8.8",
+            "2606:4700:4700::1111",
+            "2001:4860:4860::8888",
+        ] {
+            assert!(is_public_ip(address.parse().unwrap()), "{address}");
+        }
+        for address in [
+            "0.0.0.0",
+            "10.0.0.1",
+            "100.64.0.1",
+            "127.0.0.1",
+            "169.254.1.1",
+            "172.16.0.1",
+            "192.0.2.1",
+            "192.168.1.1",
+            "198.18.0.1",
+            "198.51.100.1",
+            "203.0.113.1",
+            "224.0.0.1",
+            "255.255.255.255",
+            "::",
+            "::1",
+            "::ffff:127.0.0.1",
+            "2001:db8::1",
+            "fc00::1",
+            "fe80::1",
+            "ff02::1",
+        ] {
+            assert!(!is_public_ip(address.parse().unwrap()), "{address}");
+        }
     }
 
     #[test]
