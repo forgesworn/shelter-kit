@@ -362,7 +362,7 @@ Each owner signs by committing their name and the date to this file from their
 own identity. A signature means: I have read both halves and §E, and I bind my
 product to this contract at this version.
 
-- Wildbloom / ForgeSworn Link owner: __________________________  date: __________
+- Wildbloom / ForgeSworn Link owner: **TheCryptoDonkey**  date: **2026-08-28**
 - Bothy owner: __________________________  date: __________
 
 # E. Owner item -- the envelope's independent review
@@ -379,6 +379,8 @@ review, and does it gate the first shipped release or run in parallel.
   for both products: *internally reviewed with independent models; open source
   for external review; not professionally audited.* Findings recorded by date
   beside `ENVELOPE.md`.
-- **Wildbloom / ForgeSworn side:** _pending; to be recorded here in the
-  owner's words. If it matches, this item closes; if it differs, the two owners
-  settle it between them._
+- **Wildbloom / ForgeSworn side, decided by its owner 2026-08-28:** in
+  agreement with the Bothy side, same wording: the envelope is internally
+  reviewed with independent models, open source for external review, and not
+  professionally audited; no paid external audit and it gates nothing. Both
+  sides carry the same wording. This closes the item.
