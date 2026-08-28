@@ -92,7 +92,7 @@ recover the reserve between its water-marks.
 
 ## 4. Authorisation
 
-A BUD-11 event (kind `24242`, `Authorization: Nostr <base64url>`) MUST have
+A BUD-11 event (kind `24242`, `Authorization: Nostr <base64>`) MUST have
 a valid id and signature; exactly one `t` and one `expiration`; at least one
 well-formed `x` and one `server`, whose sets include the current blob and
 the current node's name; MUST NOT be materially in the future; MUST have a
