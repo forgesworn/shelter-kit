@@ -10,7 +10,7 @@ both owners.*
 ## What 0.3 adds over 0.2
 
 The shared encryption envelope is specified as **FSWNENC2**, in
-[`FSWNENC2.md`](https://github.com/forgesworn/wildbloom/blob/main/docs/FSWNENC2.md),
+[`FSWNENC2.md`](https://github.com/forgesworn/wildbloom/blob/7b3ae7f/docs/FSWNENC2.md),
 superseding the implicit `FSWNENC1` construction both products had been using.
 
 FSWNENC2 exists to close one exposure the review found: `FSWNENC1` is nonce-safe
@@ -44,7 +44,7 @@ re-sealing is an opt-in step later.
 
 0.2 §E asked for an independent review of the envelope. That review is done and
 recorded in
-[`ENVELOPE-REVIEW.md`](https://github.com/forgesworn/wildbloom/blob/main/docs/ENVELOPE-REVIEW.md):
+[`ENVELOPE-REVIEW.md`](https://github.com/forgesworn/wildbloom/blob/7b3ae7f/docs/ENVELOPE-REVIEW.md):
 internally reviewed with independent models, open source for external review,
 not professionally audited, gating nothing -- the wording both owners agreed in
 0.2 §E. FSWNENC2 is the review's principal remediation; the remaining review
