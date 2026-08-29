@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.1.2 - 2026-08-29
+
+- Accept standard base64 in BUD-11 authorisation, not only url-safe. BUD-01
+  specifies standard base64; the decoder now reads both alphabets, padded or
+  unpadded, so a spec-compliant client and stash-rs verify while existing
+  url-safe clients keep working.
+
 ## 0.1.1 - 2026-08-28
 
 - Add a direct public-HTTPS mirror and repair adapter.
