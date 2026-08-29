@@ -56,5 +56,5 @@ Each owner signs by committing their name and the date to this file from their
 own identity. A signature means: I have read 0.2, this 0.3 bump and
 `FSWNENC2.md`, and I bind my product to the contract at this version.
 
-- Wildbloom / ForgeSworn Link owner:  date:
+- Wildbloom / ForgeSworn Link owner: **TheCryptoDonkey**  date: **2026-08-29**
 - Bothy owner: **decented**  date: **2026-08-29**
