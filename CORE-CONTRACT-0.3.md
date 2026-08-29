@@ -57,4 +57,4 @@ own identity. A signature means: I have read 0.2, this 0.3 bump and
 `FSWNENC2.md`, and I bind my product to the contract at this version.
 
 - Wildbloom / ForgeSworn Link owner:  date:
-- Bothy owner:  date:
+- Bothy owner: **decented**  date: **2026-08-29**
