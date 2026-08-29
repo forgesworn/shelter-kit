@@ -363,7 +363,7 @@ own identity. A signature means: I have read both halves and §E, and I bind my
 product to this contract at this version.
 
 - Wildbloom / ForgeSworn Link owner: **TheCryptoDonkey**  date: **2026-08-28**
-- Bothy owner: __________________________  date: __________
+- Bothy owner: **decented**  date: **2026-08-29**
 
 # E. Owner item -- the envelope's independent review
 
