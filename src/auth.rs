@@ -1,3 +1,4 @@
+use crate::store::normalised_class;
 use base64::{
     Engine as _,
     engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD},
@@ -25,6 +26,14 @@ pub struct VerifiedUpload {
     pub owner_pubkey: String,
     pub event_id: String,
     pub expires_at: u64,
+    /// The advisory `class` this event carried, if it carried exactly one
+    /// well-formed tag within bounds.
+    ///
+    /// No tag, a second tag, a malformed tag or a value outside the bound all
+    /// read as `None`, and none of them refuses the event: BUD-11's
+    /// duplicate-singleton rule covers the tags that carry authority, and this
+    /// one carries none.
+    pub class: Option<String>,
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -229,6 +238,7 @@ impl AuthPolicy {
             owner_pubkey: raw.pubkey,
             event_id: raw.id,
             expires_at,
+            class: optional_class_tag(&raw.tags),
         })
     }
 }
@@ -253,6 +263,17 @@ fn scoped_tags<'a>(tags: &'a [Vec<String>], name: &str) -> Result<Vec<&'a str>, 
         return Err(AuthError::AmbiguousTags);
     }
     Ok(matches.iter().map(|tag| tag[1].as_str()).collect())
+}
+
+/// The single `class` tag on an authorising event, when there is exactly one
+/// well-formed tag whose value is within the store's bound.
+fn optional_class_tag(tags: &[Vec<String>]) -> Option<String> {
+    let mut matches = tags
+        .iter()
+        .filter(|tag| tag.first().is_some_and(|kind| kind == "class"));
+    let only = matches.next().filter(|tag| tag.len() == 2)?;
+    matches.next().is_none().then_some(())?;
+    normalised_class(Some(only[1].as_str()))
 }
 
 fn is_canonical_hash(value: &str) -> bool {
@@ -335,6 +356,39 @@ mod tests {
 
     fn public_policy() -> AuthPolicy {
         AuthPolicy::new(["node.example"]).with_public_writes(true)
+    }
+
+    #[test]
+    fn a_class_tag_is_advisory_and_never_refuses_an_event() {
+        let hash = "a".repeat(64);
+        let policy = public_policy();
+        let verify = |tags: Vec<Vec<String>>| {
+            policy
+                .verify_upload(Some(&header(tags, 1_000)), &hash, 1_010)
+                .unwrap()
+                .class
+        };
+
+        assert_eq!(verify(valid_tags(&hash, 1_120)), None);
+
+        let mut tagged = valid_tags(&hash, 1_120);
+        tagged.push(vec!["class".into(), "vital".into()]);
+        assert_eq!(verify(tagged.clone()), Some("vital".to_owned()));
+
+        // A second class tag is ambiguous, so the core reads no class at all --
+        // and still accepts the event, because the tag is advisory.
+        let mut duplicated = tagged.clone();
+        duplicated.push(vec!["class".into(), "working".into()]);
+        assert_eq!(verify(duplicated), None);
+
+        // So is a malformed tag or a value outside the bound.
+        let mut malformed = valid_tags(&hash, 1_120);
+        malformed.push(vec!["class".into(), "vital".into(), "extra".into()]);
+        assert_eq!(verify(malformed), None);
+
+        let mut shouty = valid_tags(&hash, 1_120);
+        shouty.push(vec!["class".into(), "VITAL".into()]);
+        assert_eq!(verify(shouty), None);
     }
 
     #[test]

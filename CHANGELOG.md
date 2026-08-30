@@ -9,6 +9,11 @@
 - Add `FriendGrant::issuer`, so revoking every grant from one issuer is a
   single `set_friend_grants` call.
 - Add `AppState::reconcile_now` and `BlossomConfigError::Task`.
+- Carry a nullable, advisory `class` on every claim and reservation, set from a
+  `class` tag on the authorising event and returned in `/list` descriptors.  It
+  never influences the retention tier, eviction or serving (joint core contract
+  0.2 §3, §5).  Schema `user_version = 3`: an added column, so every blob and
+  claim migrates forward in place.
 
 ## 0.1.2 - 2026-08-29
 

@@ -34,6 +34,8 @@ and router.
 - Runtime owner set and friend grants: `AppState::set_owner_keys` and
   `AppState::set_friend_grants`, applied at a reconcile boundary.
 - `FriendGrant::issuer`, so a shell can revoke every grant from one issuer.
+- A nullable `class` on every claim and reservation, returned in list
+  descriptors.  Schema `user_version = 3`.
 
 A minor bump, not a patch: the API is additive but the capability is new, and
 `FriendGrant` gained a field.
@@ -80,6 +82,22 @@ promoting a friend to keeper is two ordered calls.  An in-flight upload always
 commits under the policy it started with; a grant carries an optional `issuer`,
 so revoking everything one issuer handed out is a single
 `set_friend_grants` call with those grants left out.
+
+## Claim class
+
+A claim carries a nullable `class`, taken from a single `class` tag on the
+authorising event, and `null` means "the shell's default".  It is the shell's
+own label -- Bothy's `working`, `circle`, `vital`, `open` -- and the core
+neither reads nor acts on it: it changes no retention tier, no eviction
+decision and nothing about serving, and no response header mentions it.  It is
+recorded, and it comes back in the `/list/<pubkey>` descriptors so the shell can
+read its own label off the store.
+
+The bound is 1 to 32 bytes of `[a-z0-9-]`.  A value outside it, a second `class`
+tag, or a malformed one, is absent rather than an error: the tag carries no
+authority, so refusing an otherwise valid upload over a label the core does not
+act on would fail a good write for nothing.  A shell that cares reads the `null`
+back in the descriptor.
 
 ## Status
 
