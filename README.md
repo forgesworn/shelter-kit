@@ -83,6 +83,19 @@ commits under the policy it started with; a grant carries an optional `issuer`,
 so revoking everything one issuer handed out is a single
 `set_friend_grants` call with those grants left out.
 
+The storage quota is likewise a runtime value, not a fixed reading from
+`StoreConfig`: `AppState::set_quota(bytes)` re-supplies it at the same
+reconcile boundary, so the watermarks it drives and every reservation
+decision see the new figure the moment the boundary is crossed, and an
+in-flight write keeps the quota that was live when its reservation began.
+It is validated exactly as `StoreConfig::quota_bytes` is at construction
+(at least 2 bytes, at most `i64::MAX`), and refused, leaving the running
+node untouched, if the store already holds more bytes than the new figure
+allows for -- stored blobs and in-flight reservations both counted, as
+`stats()` counts them.  Shrinking the pool below its low watermark evicts
+guest claims once, immediately, at the same boundary, rather than waiting
+for the next write to trigger it.
+
 ## BUD-11 server tags
 
 A configured accepted server name, and the `server` tag on an authorising

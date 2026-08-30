@@ -145,6 +145,8 @@ pub enum BlossomConfigError {
     Task,
     #[error(transparent)]
     Storage(#[from] StoreError),
+    #[error("requested quota of {requested} bytes is below the {used} bytes currently held")]
+    QuotaBelowUsage { requested: u64, used: u64 },
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -429,7 +431,8 @@ impl AppState {
             current.open_shelter,
             &self.inner.accepted_server_names,
         )?;
-        self.apply_at_reconcile_boundary(Some(Arc::new(next))).await
+        self.apply_at_reconcile_boundary(Some(Arc::new(next)), None)
+            .await
     }
 
     /// Re-supplies the friend-grant set; contract 0.2 §3 B2 and B3.
@@ -449,13 +452,36 @@ impl AppState {
             current.open_shelter,
             &self.inner.accepted_server_names,
         )?;
-        self.apply_at_reconcile_boundary(Some(Arc::new(next))).await
+        self.apply_at_reconcile_boundary(Some(Arc::new(next)), None)
+            .await
     }
 
     /// Crosses a reconcile boundary without changing the policy: claims whose
     /// grant has expired since the last boundary are demoted.
     pub async fn reconcile_now(&self) -> Result<(), BlossomConfigError> {
-        self.apply_at_reconcile_boundary(None).await
+        self.apply_at_reconcile_boundary(None, None).await
+    }
+
+    /// Re-supplies the storage quota; contract 0.2 §3 B13.
+    ///
+    /// Applied at the same reconcile boundary as [`AppState::set_owner_keys`]
+    /// and [`AppState::set_friend_grants`] — every write permit held, so no
+    /// upload or mirror is in flight and none can start until this returns.
+    /// An in-flight write already holds its reservation under the quota that
+    /// was live when it began; this never re-judges it.
+    ///
+    /// Refused, and the running node left untouched, when the store
+    /// currently holds more than `bytes` — stored blobs plus in-flight
+    /// reservations, exactly as [`crate::store::StoreStats`] counts them —
+    /// or when `bytes` fails the same bound [`crate::store::StoreConfig`]
+    /// does at construction (at least 2 bytes, at most `i64::MAX`).
+    ///
+    /// On success, if shrinking the pool has put its free space below the
+    /// low watermark, guest claims are evicted once, immediately, at this
+    /// same boundary — so a smaller quota reclaims guest space at once
+    /// rather than waiting for the next write to trigger it.
+    pub async fn set_quota(&self, bytes: u64) -> Result<(), BlossomConfigError> {
+        self.apply_at_reconcile_boundary(None, Some(bytes)).await
     }
 
     /// The reconcile boundary of contract 0.2 §3, as one primitive.
@@ -471,7 +497,8 @@ impl AppState {
     /// blob that already exists and never creates or re-tiers a claim.
     async fn apply_at_reconcile_boundary(
         &self,
-        pending: Option<Arc<Policy>>,
+        pending_policy: Option<Arc<Policy>>,
+        pending_quota: Option<u64>,
     ) -> Result<(), BlossomConfigError> {
         let _write_permits = self
             .inner
@@ -480,8 +507,20 @@ impl AppState {
             .acquire_many_owned(self.inner.write_slot_count)
             .await
             .expect("the write semaphore is private and never closed");
-        if let Some(pending) = pending {
+        if let Some(pending) = pending_policy {
             *self.inner.policy.write().await = pending;
+        }
+        if let Some(bytes) = pending_quota {
+            let store = self.inner.store.clone();
+            spawn_blocking(move || store.set_quota_bytes(bytes))
+                .await
+                .map_err(|_| BlossomConfigError::Task)?
+                .map_err(|error| match error {
+                    StoreError::QuotaBelowUsage { requested, used } => {
+                        BlossomConfigError::QuotaBelowUsage { requested, used }
+                    }
+                    other => BlossomConfigError::from(other),
+                })?;
         }
         let policy = self.policy().await;
         let store = self.inner.store.clone();
@@ -494,6 +533,15 @@ impl AppState {
         .map_err(|_| BlossomConfigError::Task)??;
         if demoted > 0 {
             tracing::warn!(demoted, "demoted claims no longer covered by node policy");
+        }
+        if pending_quota.is_some() {
+            let store = self.inner.store.clone();
+            let freed = spawn_blocking(move || store.evict_to_watermark())
+                .await
+                .map_err(|_| BlossomConfigError::Task)??;
+            if freed > 0 {
+                tracing::info!(freed, "evicted guest storage after a quota reduction");
+            }
         }
         Ok(())
     }
@@ -2294,6 +2342,45 @@ mod tests {
         store.get(hash).unwrap().unwrap().retention_tier
     }
 
+    fn open_store_with_quota(directory: &tempfile::TempDir, quota_bytes: u64) -> Store {
+        Store::open(crate::store::StoreConfig {
+            root: directory.path().join("data"),
+            quota_bytes,
+            max_blob_bytes: 4096,
+        })
+        .unwrap()
+    }
+
+    /// Stores a guest claim directly against the store, bypassing HTTP:
+    /// guest admission is mirror-only (BUD-04), so this is the plain way to
+    /// give a test a guest blob to evict.
+    fn store_guest_claim(store: &Store, bytes: &[u8], signer: &str) -> String {
+        let hash = hex::encode(Sha256::digest(bytes));
+        match store
+            .begin_claimed_upload(
+                &hash,
+                bytes.len() as u64,
+                ClaimSpec {
+                    signer_pubkey: signer.to_owned(),
+                    retention_tier: RetentionTier::Guest,
+                    declared_type: "text/plain".to_owned(),
+                    grant_id: None,
+                    claim_expires_at: None,
+                    byte_limit: None,
+                    class: None,
+                },
+            )
+            .unwrap()
+        {
+            UploadStart::Existing(_) => {}
+            UploadStart::Reserved(reservation) => {
+                std::fs::write(reservation.temp_path(), bytes).unwrap();
+                reservation.commit(&hash, bytes.len() as u64).unwrap();
+            }
+        }
+        hash
+    }
+
     #[tokio::test]
     async fn a_runtime_owner_key_promotes_a_later_upload() {
         let directory = tempfile::tempdir().unwrap();
@@ -2468,6 +2555,196 @@ mod tests {
             serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
                 .unwrap();
         assert_eq!(descriptor["type"], "text/plain");
+    }
+
+    #[tokio::test]
+    async fn set_quota_raises_the_quota_and_the_marks_follow() {
+        // Under quota 100 (low 10, high 20) a 15-byte guest sitting next to
+        // an 80-byte owner write leaves only 5 bytes free — below the low
+        // watermark — so the reservation path evicts the guest to buy back
+        // headroom. Raising the quota first moves the marks up with it: the
+        // same owner write no longer needs the guest's space, and the guest
+        // survives. The marks are private, so this is the only way to show
+        // they moved.
+        async fn evicts_guest_for_owner_upload(raise_to: Option<u64>) -> bool {
+            let directory = tempfile::tempdir().unwrap();
+            let store = open_store_with_quota(&directory, 100);
+            let state = AppState::new(store.clone(), test_config()).unwrap();
+            let guest_hash = store_guest_claim(&store, &[b'g'; 15], &pubkey_for(9));
+            if let Some(new_quota) = raise_to {
+                state.set_quota(new_quota).await.unwrap();
+                assert_eq!(store.stats().unwrap().quota_bytes, new_quota);
+            }
+            let app = router(state);
+            let now = unix_time();
+            let response = app
+                .oneshot(upload_request(1, &[b'o'; 80], now))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CREATED);
+            store.get(&guest_hash).unwrap().is_none()
+        }
+
+        assert!(evicts_guest_for_owner_upload(None).await);
+        assert!(!evicts_guest_for_owner_upload(Some(1000)).await);
+    }
+
+    #[tokio::test]
+    async fn set_quota_below_usage_is_refused_with_the_numbers_and_changes_nothing() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = open_store_with_quota(&directory, 1000);
+        let state = AppState::new(store.clone(), test_config()).unwrap();
+        let app = router(state.clone());
+        let now = unix_time();
+
+        let bytes = b"owner bytes that count toward usage";
+        let hash = hex::encode(Sha256::digest(bytes));
+        let response = app.oneshot(upload_request(1, bytes, now)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let used = store.stats().unwrap().bytes;
+        assert_eq!(used, bytes.len() as u64);
+
+        let result = state.set_quota(used - 1).await;
+        assert!(matches!(
+            result,
+            Err(BlossomConfigError::QuotaBelowUsage { requested, used: reported })
+                if requested == used - 1 && reported == used
+        ));
+
+        // Nothing moved: the quota and the blob are exactly as they were.
+        assert_eq!(store.stats().unwrap().quota_bytes, 1000);
+        assert!(store.get(&hash).unwrap().is_some());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn set_quota_applies_only_at_the_boundary() {
+        use std::time::Duration;
+
+        let directory = tempfile::tempdir().unwrap();
+        let store = open_store_with_quota(&directory, 1000);
+        let state = AppState::new(store.clone(), test_config()).unwrap();
+        let app = router(state.clone());
+        let now = unix_time();
+
+        let head = Bytes::from(vec![b'h'; 90]);
+        let tail = Bytes::from(vec![b't'; 60]);
+        let bytes = [head.as_ref(), tail.as_ref()].concat();
+        let hash = hex::encode(Sha256::digest(&bytes));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let body = futures_util::stream::once(async move { Ok::<Bytes, std::io::Error>(head) })
+            .chain(futures_util::stream::once(async move {
+                // Polled only once the handler holds its write permit and
+                // has already reserved space under today's quota.
+                let _ = started_tx.send(());
+                let _ = release_rx.await;
+                Ok(tail)
+            }));
+        let request = Request::builder()
+            .method(Method::PUT)
+            .uri("/upload")
+            .header(CONTENT_TYPE, "text/plain")
+            .header(CONTENT_LENGTH, bytes.len())
+            .header(&X_SHA_256, &hash)
+            .header(
+                AUTHORIZATION,
+                operation_authorization_for(1, Some(&hash), now, "upload"),
+            )
+            .body(Body::from_stream(body))
+            .unwrap();
+        let streaming = app.clone();
+        let upload = tokio::spawn(async move { streaming.oneshot(request).await.unwrap() });
+        started_rx.await.unwrap();
+
+        let quota_state = state.clone();
+        let mut quota_change = tokio::spawn(async move { quota_state.set_quota(100).await });
+        // The reconcile boundary is never crossed while a write is in flight.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut quota_change)
+                .await
+                .is_err()
+        );
+
+        // Nor can a new write start: the waiting boundary holds every permit
+        // a release could hand out.
+        let response = app
+            .clone()
+            .oneshot(upload_request(
+                1,
+                b"a write that arrives at the boundary",
+                now,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        release_tx.send(()).unwrap();
+        let response = upload.await.unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        // The reservation was judged under the quota live when it began
+        // (1000), not the 100 requested while it streamed: it completed
+        // regardless. The pending reduction is only now seen at the
+        // boundary, and refused, because the 150 bytes it left behind
+        // count as usage the moment it is judged.
+        assert!(matches!(
+            quota_change.await.unwrap(),
+            Err(BlossomConfigError::QuotaBelowUsage {
+                requested: 100,
+                used: 150
+            })
+        ));
+        assert_eq!(store.stats().unwrap().quota_bytes, 1000);
+    }
+
+    #[tokio::test]
+    async fn shrinking_a_pool_evicts_guest_at_the_boundary() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = open_store_with_quota(&directory, 1000);
+        let state = AppState::new(store.clone(), test_config()).unwrap();
+        let app = router(state.clone());
+        let now = unix_time();
+
+        let guest_hash = store_guest_claim(&store, &[b'g'; 300], &pubkey_for(9));
+        let owner_bytes = [b'o'; 50];
+        let owner_hash = hex::encode(Sha256::digest(owner_bytes));
+        let response = app
+            .clone()
+            .oneshot(upload_request(1, &owner_bytes, now))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        // 360 still covers the 350 bytes held, so the reduction itself is
+        // accepted; its low watermark (36) leaves only 10 bytes free,
+        // though, so the guest is reclaimed at this same boundary rather
+        // than mid-stream at the next write.
+        state.set_quota(360).await.unwrap();
+
+        assert!(store.get(&guest_hash).unwrap().is_none());
+        assert_eq!(tier_of(&store, &owner_hash), RetentionTier::Owner);
+        let stats = store.stats().unwrap();
+        assert_eq!(stats.quota_bytes, 360);
+        assert_eq!(stats.bytes, 50);
+    }
+
+    #[tokio::test]
+    async fn an_invalid_quota_is_rejected_like_construction() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = open_store_with_quota(&directory, 1000);
+        let state = AppState::new(store.clone(), test_config()).unwrap();
+
+        assert!(matches!(
+            state.set_quota(1).await,
+            Err(BlossomConfigError::Storage(StoreError::InvalidWatermarks))
+        ));
+        assert!(matches!(
+            state.set_quota(i64::MAX as u64 + 1).await,
+            Err(BlossomConfigError::Storage(StoreError::IntegerRange))
+        ));
+
+        // Nothing moved: the original quota still governs admission.
+        assert_eq!(store.stats().unwrap().quota_bytes, 1000);
     }
 
     #[tokio::test]
