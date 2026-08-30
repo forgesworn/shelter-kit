@@ -600,7 +600,17 @@ async fn try_repair_candidate(
     let Ok(source_url) = Url::parse(source) else {
         return Ok(false);
     };
-    if mirror_hash_from_url(&source_url) != Some(candidate.sha256.as_str()) {
+    // Contract item B14: repair dispatches by lane, exactly as fetching does
+    // (0.2 T6).  The http/https lane keeps its full safety validation; any
+    // other scheme -- fsl:// today, another lane tomorrow -- is the
+    // registered fetcher's to answer, and a fetcher that does not speak it
+    // returns UnsupportedSource, which reads as skip-this-source below.  The
+    // one caller-side check for a lane source is that it names this blob.
+    let names_hash = match source_url.scheme() {
+        "http" | "https" => mirror_hash_from_url(&source_url) == Some(candidate.sha256.as_str()),
+        _ => lane_hash_from_url(&source_url) == Some(candidate.sha256.as_str()),
+    };
+    if !names_hash {
         return Ok(false);
     }
     let request = FetchRequest {
@@ -1214,6 +1224,21 @@ async fn serve_blob(
         );
     }
     response.body(body).map_err(|_| ApiError::internal())
+}
+
+/// The blob hash a non-HTTP lane source names: the last path segment before
+/// any extension, when it is exactly 64 lower-case hex characters.  This is
+/// the `fsl://<node>/<sha256>[.<ext>]` shape and the generic rule for any
+/// future lane; everything else about the source is the lane fetcher's to
+/// validate (contract item B14).
+fn lane_hash_from_url(url: &Url) -> Option<&str> {
+    let segment = url.path_segments()?.next_back()?;
+    let hash = segment.split('.').next()?;
+    (hash.len() == 64
+        && hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')))
+    .then_some(hash)
 }
 
 fn mirror_hash_from_url(url: &Url) -> Option<&str> {
@@ -2027,6 +2052,75 @@ mod tests {
             download(&app, &hash).await,
             (StatusCode::OK, Bytes::copy_from_slice(bytes))
         );
+    }
+
+    #[tokio::test]
+    async fn repair_uses_a_lane_source_and_skips_a_scheme_no_fetcher_speaks() {
+        // Contract item B14: a recorded fsl:// source repairs through the
+        // registered fetcher, and a source in a scheme nothing speaks is a
+        // skipped source, never a fatal error.
+        let directory = tempfile::tempdir().unwrap();
+        let bytes = b"bytes that come home over the native lane";
+        let hash = hex::encode(Sha256::digest(bytes));
+        let fetcher = FakeFetcher::serving(bytes);
+        let state =
+            AppState::with_fetcher(open_store(&directory), test_config(), fetcher.clone()).unwrap();
+        let app = router(state.clone());
+        let now = unix_time();
+
+        // The blob arrives normally, then its repair sources are recorded: a
+        // lane source (as a shell records from a peer's card) and a source in
+        // a scheme no registered fetcher will ever speak.
+        let response = app
+            .clone()
+            .oneshot(upload_request(1, bytes, now))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let node = "b".repeat(52);
+        let lane_source = format!("fsl://{node}/{hash}");
+        state
+            .store()
+            .record_repair_source(&hash, &format!("junk://nowhere/{hash}"))
+            .unwrap();
+        state
+            .store()
+            .record_repair_source(&hash, &lane_source)
+            .unwrap();
+
+        // Deliberate local loss, then repair.  The junk scheme is skipped
+        // (the fake fetcher records every request it sees, so we can prove
+        // which sources were actually tried) and the lane source repairs.
+        std::fs::remove_file(state.store().blob_path(&hash)).unwrap();
+        let report = state.repair_once().await.unwrap();
+        assert_eq!(
+            report,
+            RepairReport {
+                candidates: 1,
+                repaired: 1,
+                unrepaired: Vec::new(),
+            }
+        );
+        let requests = fetcher.requests();
+        assert_eq!(requests.len(), 1, "one source fetched: {requests:#?}");
+        assert_eq!(requests[0].source.as_str(), lane_source);
+        assert_eq!(requests[0].sha256, hash);
+        let integrity = state.store().verify_integrity().unwrap();
+        assert!(integrity.missing.is_empty() && integrity.corrupted.is_empty());
+
+        // A lane source that names a different blob is refused before the
+        // fetcher ever sees it.
+        let other = "c".repeat(64);
+        state
+            .store()
+            .record_repair_source(&hash, &format!("fsl://{node}/{other}"))
+            .unwrap();
+        std::fs::remove_file(state.store().blob_path(&hash)).unwrap();
+        let report = state.repair_once().await.unwrap();
+        assert_eq!(report.repaired, 1);
+        let requests = fetcher.requests();
+        assert_eq!(requests.len(), 2, "the mismatched source was never tried");
+        assert_eq!(requests[1].source.as_str(), lane_source);
     }
 
     #[tokio::test]
