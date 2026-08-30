@@ -2,6 +2,12 @@
 
 ## 0.2.0 - 2026-08-30
 
+- Supply the storage quota at runtime through `AppState::set_quota`, applied
+  at the same reconcile boundary as the owner set and friend grants, and
+  refused with the requested and currently-held byte counts when the pool
+  already holds more than the new figure allows for (joint core contract
+  0.2 §3, item B13). Shrinking the pool below its low watermark evicts
+  guest claims once, immediately, at that boundary.
 - Supply the owner set and the friend grants at runtime through
   `AppState::set_owner_keys` and `AppState::set_friend_grants`, applied at a
   reconcile boundary that never lands mid-stream against an in-flight upload

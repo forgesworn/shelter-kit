@@ -6,7 +6,10 @@ use std::{
     fs::{self, File},
     io::Read,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
@@ -70,6 +73,11 @@ pub struct Store {
     config: StoreConfig,
     database_path: PathBuf,
     _lock: Arc<File>,
+    /// The quota actually in force, shared across every clone of this
+    /// `Store` so that [`Store::set_quota_bytes`] takes effect for every
+    /// handle rather than the one it was called on. `config.quota_bytes`
+    /// stays the value the store was opened with; this is the live one.
+    live_quota_bytes: Arc<AtomicU64>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -241,6 +249,8 @@ pub enum StoreError {
     InvalidListLimit,
     #[error("the storage quota is too small for valid watermarks")]
     InvalidWatermarks,
+    #[error("requested quota of {requested} bytes is below the {used} bytes currently held")]
+    QuotaBelowUsage { requested: u64, used: u64 },
     #[error("another shelter process is already using this data directory")]
     AlreadyOpen,
     #[error("integer is outside the supported storage range")]
@@ -282,6 +292,7 @@ impl Store {
 
         let database_path = config.root.join("wildbloom.sqlite3");
         let store = Self {
+            live_quota_bytes: Arc::new(AtomicU64::new(config.quota_bytes)),
             config,
             database_path,
             _lock: Arc::new(lock),
@@ -292,8 +303,94 @@ impl Store {
         Ok(store)
     }
 
-    pub fn config(&self) -> &StoreConfig {
-        &self.config
+    /// The store's configuration, with `quota_bytes` reported live: it
+    /// reflects [`Store::set_quota_bytes`], not the value the store was
+    /// opened with.
+    pub fn config(&self) -> StoreConfig {
+        StoreConfig {
+            quota_bytes: self.quota_bytes(),
+            ..self.config.clone()
+        }
+    }
+
+    /// The quota currently in force. May differ from the value the store
+    /// was opened with once [`Store::set_quota_bytes`] has changed it;
+    /// every watermark and reservation decision reads this, never a
+    /// snapshot taken at construction.
+    pub fn quota_bytes(&self) -> u64 {
+        self.live_quota_bytes.load(Ordering::SeqCst)
+    }
+
+    /// Re-supplies the storage quota; contract 0.2 §3 B13.
+    ///
+    /// Validated exactly like [`StoreConfig::quota_bytes`] at construction:
+    /// at least 2 bytes, and no more than `i64::MAX`. Refused, leaving the
+    /// live quota untouched, when the store currently holds more bytes than
+    /// `bytes` allows for — stored blobs plus in-flight reservations,
+    /// counted the same way [`Store::stats`] counts them.
+    ///
+    /// On success the new value takes effect immediately for every
+    /// subsequent watermark and reservation decision across every clone of
+    /// this store. It does not itself evict anything: a caller that
+    /// shrinks the pool below its low watermark should follow with
+    /// [`Store::evict_to_watermark`].
+    pub fn set_quota_bytes(&self, bytes: u64) -> Result<(), StoreError> {
+        if bytes > i64::MAX as u64 {
+            return Err(StoreError::IntegerRange);
+        }
+        if bytes < 2 {
+            return Err(StoreError::InvalidWatermarks);
+        }
+        let connection = self.connection()?;
+        let used: i64 = connection.query_row(
+            "SELECT COALESCE((SELECT SUM(size) FROM blobs), 0) + \
+                    COALESCE((SELECT SUM(size) FROM reservations), 0)",
+            [],
+            |row| row.get(0),
+        )?;
+        let used = u64::try_from(used).map_err(|_| StoreError::IntegerRange)?;
+        if bytes < used {
+            return Err(StoreError::QuotaBelowUsage {
+                requested: bytes,
+                used,
+            });
+        }
+        self.live_quota_bytes.store(bytes, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Evicts guest claims once toward the low watermark, admitting
+    /// nothing new. A no-op, returning `0`, when free space already meets
+    /// the low watermark. Returns the number of bytes reclaimed.
+    ///
+    /// Exists so a shell can reclaim guest space immediately after
+    /// [`Store::set_quota_bytes`] shrinks the pool, at the same boundary,
+    /// rather than waiting for the next write to trigger the eviction the
+    /// reservation path already performs for itself.
+    pub fn evict_to_watermark(&self) -> Result<u64, StoreError> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let now = unix_time()?;
+        let used: i64 = transaction.query_row(
+            "SELECT COALESCE((SELECT SUM(size) FROM blobs), 0) + \
+                    COALESCE((SELECT SUM(size) FROM reservations), 0)",
+            [],
+            |row| row.get(0),
+        )?;
+        let quota = i64::try_from(self.quota_bytes()).map_err(|_| StoreError::IntegerRange)?;
+        let (low, high) = self.watermarks()?;
+        let low = i64::try_from(low).map_err(|_| StoreError::IntegerRange)?;
+        let high = i64::try_from(high).map_err(|_| StoreError::IntegerRange)?;
+        let predicted_free = quota.saturating_sub(used);
+        if predicted_free >= low {
+            return Ok(0);
+        }
+        let must_free = high.saturating_sub(predicted_free);
+        let evictions = self.evict_guests(&transaction, must_free, now)?;
+        let freed = u64::try_from(evictions.bytes_i64()).map_err(|_| StoreError::IntegerRange)?;
+        transaction.commit()?;
+        evictions.commit();
+        Ok(freed)
     }
 
     pub fn begin_upload(
@@ -363,7 +460,7 @@ impl Store {
             [],
             |row| row.get(0),
         )?;
-        let quota = i64::try_from(self.config.quota_bytes).map_err(|_| StoreError::IntegerRange)?;
+        let quota = i64::try_from(self.quota_bytes()).map_err(|_| StoreError::IntegerRange)?;
         let (low, high) = self.watermarks()?;
         let low = i64::try_from(low).map_err(|_| StoreError::IntegerRange)?;
         let high = i64::try_from(high).map_err(|_| StoreError::IntegerRange)?;
@@ -479,7 +576,7 @@ impl Store {
             [],
             |row| row.get(0),
         )?;
-        let quota = i64::try_from(self.config.quota_bytes).map_err(|_| StoreError::IntegerRange)?;
+        let quota = i64::try_from(self.quota_bytes()).map_err(|_| StoreError::IntegerRange)?;
         let (_, high) = self.watermarks()?;
         match claim.retention_tier {
             RetentionTier::Guest => {
@@ -510,11 +607,11 @@ impl Store {
     }
 
     fn watermarks(&self) -> Result<(u64, u64), StoreError> {
-        let low = self.config.quota_bytes / 10;
-        let high = (self.config.quota_bytes / 5)
+        let low = self.quota_bytes() / 10;
+        let high = (self.quota_bytes() / 5)
             .max(low.saturating_add(1))
-            .min(self.config.quota_bytes.saturating_sub(1));
-        if low >= high || high >= self.config.quota_bytes {
+            .min(self.quota_bytes().saturating_sub(1));
+        if low >= high || high >= self.quota_bytes() {
             return Err(StoreError::InvalidWatermarks);
         }
         Ok((low, high))
@@ -550,7 +647,7 @@ impl Store {
             blobs: u64::try_from(blobs).map_err(|_| StoreError::IntegerRange)?,
             bytes: u64::try_from(bytes).map_err(|_| StoreError::IntegerRange)?,
             reserved_bytes: u64::try_from(reserved).map_err(|_| StoreError::IntegerRange)?,
-            quota_bytes: self.config.quota_bytes,
+            quota_bytes: self.quota_bytes(),
         })
     }
 
