@@ -83,6 +83,19 @@ commits under the policy it started with; a grant carries an optional `issuer`,
 so revoking everything one issuer handed out is a single
 `set_friend_grants` call with those grants left out.
 
+## BUD-11 server tags
+
+A configured accepted server name, and the `server` tag on an authorising
+event, may each be either a bare lowercase domain (`node.example`) or an
+absolute `http`/`https` URL with a host and optional port and nothing else
+of significance -- a query, a fragment or userinfo makes the tag malformed.
+Both shapes are accepted because real BUD-01 clients mint the latter:
+`rust-nostr`'s `TagStandard::Server` carries a full `url::Url`, so a
+compliant signer's token would otherwise be rejected by a node configured
+with a bare name, or vice versa. A bare name matches a tag on the same host
+under any scheme or port; two URLs must match exactly, scheme, host and
+port alike, with the scheme's default port elided from both sides first.
+
 ## Claim class
 
 A claim carries a nullable `class`, taken from a single `class` tag on the

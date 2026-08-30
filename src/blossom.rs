@@ -1861,6 +1861,17 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn accepts_a_url_shaped_accepted_server_name() {
+        // Contract B12: `accepted_server_names` may be a bare host or a full
+        // `http`/`https` URL, matching the shape a BUD-11 `server` tag
+        // actually carries on the wire.
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = test_config();
+        config.accepted_server_names = vec!["https://node.example".into()];
+        assert!(AppState::new(open_store(&directory), config).is_ok());
+    }
+
     fn mirror_request(hash: &str, now: u64) -> Request<Body> {
         mirror_request_for(hash, now, 1)
     }
