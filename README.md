@@ -29,7 +29,18 @@ and router.
 - Verified mirror sources and exact-length, exact-hash repair.
 - SQLite schema migration and interrupted-transaction reconciliation.
 
-The exact compatibility promise is in [CORE-CONTRACT.md](CORE-CONTRACT.md).
+## Added in 0.2.0
+
+- Runtime owner set and friend grants: `AppState::set_owner_keys` and
+  `AppState::set_friend_grants`, applied at a reconcile boundary.
+- `FriendGrant::issuer`, so a shell can revoke every grant from one issuer.
+
+A minor bump, not a patch: the API is additive but the capability is new, and
+`FriendGrant` gained a field.
+
+The exact compatibility promise is in [CORE-CONTRACT.md](CORE-CONTRACT.md); the
+joint 0.2 contract this implements is in
+[CORE-CONTRACT-0.2.md](CORE-CONTRACT-0.2.md).
 
 ## Not implemented here
 
@@ -52,6 +63,23 @@ listener.  The config carries the shell's public product name and HTTPS source
 URL, so shared storage does not blur the Wildbloom/Bothy front doors.  Tor and
 direct public HTTPS are supplied fetch adapters; an application may provide
 another adapter without moving trust decisions into that transport.
+
+## Runtime policy
+
+The owner set and the friend grants start in `BlossomConfig` but are not fixed
+there.  A shell may re-supply either at any time with
+`AppState::set_owner_keys(keys)` or `AppState::set_friend_grants(grants)`, and
+`AppState::reconcile_now()` crosses the same boundary without changing the
+policy.  Each call validates the whole resulting policy exactly as construction
+does, so a refusal leaves the running node untouched, and each then waits for a
+reconcile boundary: every write permit is acquired, so no upload or mirror is in
+flight and none can start, the policy is swapped, and claims that have lost
+their owner key or their grant are demoted to `guest` before the permits are
+released.  A key cannot be an owner and hold a friend grant at the same time, so
+promoting a friend to keeper is two ordered calls.  An in-flight upload always
+commits under the policy it started with; a grant carries an optional `issuer`,
+so revoking everything one issuer handed out is a single
+`set_friend_grants` call with those grants left out.
 
 ## Status
 

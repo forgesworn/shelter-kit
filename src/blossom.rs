@@ -32,7 +32,7 @@ use std::{
 use tokio::{
     fs::{File, OpenOptions},
     io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt},
-    sync::Semaphore,
+    sync::{RwLock, Semaphore},
     task::spawn_blocking,
 };
 use tokio_util::io::ReaderStream;
@@ -51,6 +51,13 @@ pub struct FriendGrant {
     pub byte_limit: u64,
     pub expires_at: u64,
     pub grant_id: String,
+    /// The public key that issued this grant, when the shell records one.
+    ///
+    /// The core never reads it for a retention decision: it exists so a shell
+    /// can drop every grant from one issuer and re-supply the remainder in a
+    /// single [`AppState::set_friend_grants`] call.  When present it must be
+    /// 64 lower-case hexadecimal characters, validated like `pubkey`.
+    pub issuer: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -98,18 +105,24 @@ struct InnerState {
     store: Store,
     server_metadata: ServerMetadata,
     public_base_url: Url,
-    trusted_auth: AuthPolicy,
+    accepted_server_names: Vec<String>,
     public_auth: AuthPolicy,
-    storage_policy: StoragePolicy,
+    /// The live owner set and friend grants, replaced whole at a reconcile
+    /// boundary.  A request clones the `Arc` once and reads nothing else, so
+    /// an in-flight upload keeps the policy it started under.
+    policy: RwLock<Arc<Policy>>,
     fetcher: Option<Arc<dyn BlobFetcher>>,
     write_slots: Arc<Semaphore>,
+    write_slot_count: u32,
 }
 
+/// Everything a write decision depends on, versioned as one immutable value.
 #[derive(Debug)]
-struct StoragePolicy {
+struct Policy {
     owner_pubkeys: BTreeSet<String>,
     friend_grants: BTreeMap<String, FriendGrant>,
     open_shelter: bool,
+    trusted_auth: AuthPolicy,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -128,6 +141,8 @@ pub enum BlossomConfigError {
     Fetcher(#[from] FetchConfigError),
     #[error("a mirror proxy and an explicit fetcher cannot both be configured")]
     ConflictingFetcher,
+    #[error("the storage policy reconcile task failed")]
+    Task,
     #[error(transparent)]
     Storage(#[from] StoreError),
 }
@@ -205,7 +220,61 @@ struct ErrorBody {
     error: &'static str,
 }
 
-impl StoragePolicy {
+impl Policy {
+    /// Validates an owner set and a friend-grant set together and derives the
+    /// authorisation policy from them.  Construction and every runtime
+    /// re-supply go through here, so both raise exactly the same errors.
+    fn build(
+        owner_keys: Vec<String>,
+        grants: Vec<FriendGrant>,
+        open_shelter: bool,
+        accepted_server_names: &[String],
+    ) -> Result<Self, BlossomConfigError> {
+        if owner_keys.iter().any(|pubkey| !is_canonical_hash(pubkey)) {
+            return Err(BlossomConfigError::InvalidWriterPubkey);
+        }
+        let owner_pubkeys = owner_keys.into_iter().collect::<BTreeSet<_>>();
+        let mut friend_grants = BTreeMap::new();
+        for grant in grants {
+            if !is_canonical_hash(&grant.pubkey)
+                || grant.byte_limit == 0
+                || grant.expires_at > i64::MAX as u64
+                || grant.grant_id.is_empty()
+                || grant.grant_id.len() > 255
+                || grant
+                    .issuer
+                    .as_deref()
+                    .is_some_and(|issuer| !is_canonical_hash(issuer))
+                || owner_pubkeys.contains(&grant.pubkey)
+                || friend_grants.insert(grant.pubkey.clone(), grant).is_some()
+            {
+                return Err(BlossomConfigError::InvalidFriendGrant);
+            }
+        }
+        let trusted_pubkeys = owner_pubkeys
+            .iter()
+            .cloned()
+            .chain(friend_grants.keys().cloned())
+            .collect::<Vec<_>>();
+        let trusted_auth =
+            AuthPolicy::new(accepted_server_names.to_vec()).with_allowed_pubkeys(trusted_pubkeys);
+        Ok(Self {
+            owner_pubkeys,
+            friend_grants,
+            open_shelter,
+            trusted_auth,
+        })
+    }
+
+    /// The `(signer, grant_id)` pairs the store reconciles friend claims
+    /// against.  A grant that has left the set demotes its claims.
+    fn active_friend_grants(&self) -> BTreeSet<(String, String)> {
+        self.friend_grants
+            .values()
+            .map(|grant| (grant.pubkey.clone(), grant.grant_id.clone()))
+            .collect()
+    }
+
     fn trusted_claim(
         &self,
         signer_pubkey: &str,
@@ -289,62 +358,132 @@ impl AppState {
         if !valid_server_metadata(&config.server_metadata) {
             return Err(BlossomConfigError::InvalidServerMetadata);
         }
-        if config
-            .allowed_pubkeys
-            .iter()
-            .any(|pubkey| !is_canonical_hash(pubkey))
-        {
-            return Err(BlossomConfigError::InvalidWriterPubkey);
-        }
         if config.max_concurrent_writes == 0 {
             return Err(BlossomConfigError::InvalidConcurrentWriteLimit);
         }
-        let owner_pubkeys = config.allowed_pubkeys.into_iter().collect::<BTreeSet<_>>();
-        let mut friend_grants = BTreeMap::new();
-        for grant in config.friend_grants {
-            if !is_canonical_hash(&grant.pubkey)
-                || grant.byte_limit == 0
-                || grant.expires_at > i64::MAX as u64
-                || grant.grant_id.is_empty()
-                || grant.grant_id.len() > 255
-                || owner_pubkeys.contains(&grant.pubkey)
-                || friend_grants.insert(grant.pubkey.clone(), grant).is_some()
-            {
-                return Err(BlossomConfigError::InvalidFriendGrant);
-            }
-        }
-        let trusted_pubkeys = owner_pubkeys
-            .iter()
-            .cloned()
-            .chain(friend_grants.keys().cloned())
-            .collect::<Vec<_>>();
-        let active_friend_grants = friend_grants
-            .values()
-            .map(|grant| (grant.pubkey.clone(), grant.grant_id.clone()))
-            .collect::<BTreeSet<_>>();
-        let demoted = store.reconcile_claim_policy(&owner_pubkeys, &active_friend_grants)?;
+        // The reconcile boundary acquires every permit at once, which the
+        // semaphore counts as a `u32`.
+        let write_slot_count = u32::try_from(config.max_concurrent_writes)
+            .map_err(|_| BlossomConfigError::InvalidConcurrentWriteLimit)?;
+        let policy = Policy::build(
+            config.allowed_pubkeys,
+            config.friend_grants,
+            config.open_shelter,
+            &config.accepted_server_names,
+        )?;
+        let demoted =
+            store.reconcile_claim_policy(&policy.owner_pubkeys, &policy.active_friend_grants())?;
         if demoted > 0 {
             tracing::warn!(demoted, "demoted claims no longer covered by node policy");
         }
-        let trusted_auth = AuthPolicy::new(config.accepted_server_names.clone())
-            .with_allowed_pubkeys(trusted_pubkeys);
-        let public_auth = AuthPolicy::new(config.accepted_server_names).with_public_writes(true);
+        let public_auth =
+            AuthPolicy::new(config.accepted_server_names.clone()).with_public_writes(true);
         Ok(Self {
             inner: Arc::new(InnerState {
                 store,
                 server_metadata: config.server_metadata,
                 public_base_url: config.public_base_url,
-                trusted_auth,
+                accepted_server_names: config.accepted_server_names,
                 public_auth,
-                storage_policy: StoragePolicy {
-                    owner_pubkeys,
-                    friend_grants,
-                    open_shelter: config.open_shelter,
-                },
+                policy: RwLock::new(Arc::new(policy)),
                 fetcher,
                 write_slots: Arc::new(Semaphore::new(config.max_concurrent_writes)),
+                write_slot_count,
             }),
         })
+    }
+
+    /// The policy a request reads for its whole lifetime.
+    ///
+    /// Taken once, at the start of a request and **before** any write permit
+    /// is acquired.  That ordering is what makes the reconcile boundary safe:
+    /// nothing ever waits on this lock while holding a permit, and the
+    /// boundary holds every permit while it waits for the lock.
+    async fn policy(&self) -> Arc<Policy> {
+        self.inner.policy.read().await.clone()
+    }
+
+    /// Re-supplies the owner set; contract 0.2 §3 B2.
+    ///
+    /// The new set is validated against the live friend grants first — a key
+    /// cannot be an owner and hold a grant at once, exactly as at construction
+    /// — so a refusal leaves the running node untouched.  It then takes effect
+    /// at the next reconcile boundary, never mid-stream.
+    pub async fn set_owner_keys(&self, keys: Vec<String>) -> Result<(), BlossomConfigError> {
+        let current = self.policy().await;
+        let next = Policy::build(
+            keys,
+            current.friend_grants.values().cloned().collect(),
+            current.open_shelter,
+            &self.inner.accepted_server_names,
+        )?;
+        self.apply_at_reconcile_boundary(Some(Arc::new(next))).await
+    }
+
+    /// Re-supplies the friend-grant set; contract 0.2 §3 B2 and B3.
+    ///
+    /// The set is authoritative: a grant that is absent from `grants` is
+    /// revoked and its claims are demoted to `guest` at this boundary.  That
+    /// is how a shell revokes every grant from one issuer — it re-supplies the
+    /// set without them.
+    pub async fn set_friend_grants(
+        &self,
+        grants: Vec<FriendGrant>,
+    ) -> Result<(), BlossomConfigError> {
+        let current = self.policy().await;
+        let next = Policy::build(
+            current.owner_pubkeys.iter().cloned().collect(),
+            grants,
+            current.open_shelter,
+            &self.inner.accepted_server_names,
+        )?;
+        self.apply_at_reconcile_boundary(Some(Arc::new(next))).await
+    }
+
+    /// Crosses a reconcile boundary without changing the policy: claims whose
+    /// grant has expired since the last boundary are demoted.
+    pub async fn reconcile_now(&self) -> Result<(), BlossomConfigError> {
+        self.apply_at_reconcile_boundary(None).await
+    }
+
+    /// The reconcile boundary of contract 0.2 §3, as one primitive.
+    ///
+    /// Acquiring *every* write permit is both halves of the contract sentence
+    /// at once: no upload or mirror is in flight, because each holds a permit
+    /// for its whole stream, and none can start, because released permits are
+    /// handed to this waiter before any new `try_acquire_owned` can barge.
+    /// The swap and the store reconciliation then happen with no writer to
+    /// race, and the permits are released together at the end.
+    ///
+    /// Repair is deliberately outside the boundary: it replaces bytes for a
+    /// blob that already exists and never creates or re-tiers a claim.
+    async fn apply_at_reconcile_boundary(
+        &self,
+        pending: Option<Arc<Policy>>,
+    ) -> Result<(), BlossomConfigError> {
+        let _write_permits = self
+            .inner
+            .write_slots
+            .clone()
+            .acquire_many_owned(self.inner.write_slot_count)
+            .await
+            .expect("the write semaphore is private and never closed");
+        if let Some(pending) = pending {
+            *self.inner.policy.write().await = pending;
+        }
+        let policy = self.policy().await;
+        let store = self.inner.store.clone();
+        let owner_pubkeys = policy.owner_pubkeys.clone();
+        let active_friend_grants = policy.active_friend_grants();
+        let demoted = spawn_blocking(move || {
+            store.reconcile_claim_policy(&owner_pubkeys, &active_friend_grants)
+        })
+        .await
+        .map_err(|_| BlossomConfigError::Task)??;
+        if demoted > 0 {
+            tracing::warn!(demoted, "demoted claims no longer covered by node policy");
+        }
+        Ok(())
     }
 
     pub fn store(&self) -> &Store {
@@ -554,6 +693,8 @@ async fn upload(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, ApiError> {
+    // One snapshot for the whole request, taken before the write permit.
+    let policy = state.policy().await;
     let expected_hash = header_str(&headers, &X_SHA_256, "missing X-SHA-256 header")?;
     if !is_canonical_hash(expected_hash) {
         return Err(ApiError::bad_request("invalid X-SHA-256 header"));
@@ -571,16 +712,11 @@ async fn upload(
     let authorization = headers
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok());
-    let verified = state
-        .inner
+    let verified = policy
         .trusted_auth
         .verify_upload(authorization, &expected_hash, unix_time())
         .map_err(ApiError::from_auth)?;
-    let claim = state.inner.storage_policy.trusted_claim(
-        &verified.owner_pubkey,
-        &content_type,
-        unix_time(),
-    )?;
+    let claim = policy.trusted_claim(&verified.owner_pubkey, &content_type, unix_time())?;
     let _write_permit = state
         .inner
         .write_slots
@@ -653,6 +789,7 @@ async fn upload_preflight(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
+    let policy = state.policy().await;
     let expected_hash = header_str(&headers, &X_SHA_256, "missing X-SHA-256 header")?;
     if !is_canonical_hash(expected_hash) {
         return Err(ApiError::bad_request("invalid X-SHA-256 header"));
@@ -671,16 +808,11 @@ async fn upload_preflight(
     let authorization = headers
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok());
-    let verified = state
-        .inner
+    let verified = policy
         .trusted_auth
         .verify_upload(authorization, expected_hash, unix_time())
         .map_err(ApiError::from_auth)?;
-    let claim = state.inner.storage_policy.trusted_claim(
-        &verified.owner_pubkey,
-        content_type,
-        unix_time(),
-    )?;
+    let claim = policy.trusted_claim(&verified.owner_pubkey, content_type, unix_time())?;
     let store = state.inner.store.clone();
     let expected_hash = expected_hash.to_owned();
     spawn_blocking(move || store.check_claimed_upload(&expected_hash, expected_size, &claim))
@@ -698,6 +830,7 @@ async fn mirror(
     headers: HeaderMap,
     payload: Result<Json<MirrorRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
+    let policy = state.policy().await;
     let fetcher = state
         .inner
         .fetcher
@@ -718,29 +851,26 @@ async fn mirror(
         .and_then(|value| value.to_str().ok());
     let now = unix_time();
     let (verified, mut claim) =
-        match state
-            .inner
+        match policy
             .trusted_auth
             .verify_upload(authorization, &expected_hash, now)
         {
             Ok(verified) => {
-                let claim = state.inner.storage_policy.trusted_claim(
+                let claim = policy.trusted_claim(
                     &verified.owner_pubkey,
                     "application/octet-stream",
                     now,
                 )?;
                 (verified, claim)
             }
-            Err(AuthError::PubkeyNotAllowed) if state.inner.storage_policy.open_shelter => {
+            Err(AuthError::PubkeyNotAllowed) if policy.open_shelter => {
                 let verified = state
                     .inner
                     .public_auth
                     .verify_upload(authorization, &expected_hash, now)
                     .map_err(ApiError::from_auth)?;
-                let claim = state
-                    .inner
-                    .storage_policy
-                    .guest_claim(&verified.owner_pubkey, "application/octet-stream")?;
+                let claim =
+                    policy.guest_claim(&verified.owner_pubkey, "application/octet-stream")?;
                 (verified, claim)
             }
             Err(error) => return Err(ApiError::from_auth(error)),
@@ -2012,6 +2142,7 @@ mod tests {
             byte_limit: 5,
             expires_at: now + 3600,
             grant_id: "test-friend".into(),
+            issuer: None,
         });
         let app = router(AppState::new(open_store(&directory), config).unwrap());
         let bytes = b"six!!!";
@@ -2033,6 +2164,280 @@ mod tests {
         assert_eq!(
             response.headers()[&X_REASON],
             "friend storage grant is full or expired"
+        );
+    }
+
+    fn upload_request(secret: u64, bytes: &[u8], now: u64) -> Request<Body> {
+        let hash = hex::encode(Sha256::digest(bytes));
+        Request::builder()
+            .method(Method::PUT)
+            .uri("/upload")
+            .header(CONTENT_TYPE, "text/plain")
+            .header(CONTENT_LENGTH, bytes.len())
+            .header(&X_SHA_256, &hash)
+            .header(
+                AUTHORIZATION,
+                operation_authorization_for(secret, Some(&hash), now, "upload"),
+            )
+            .body(Body::from(bytes.to_vec()))
+            .unwrap()
+    }
+
+    fn friend_grant(secret: u64, grant_id: &str, issuer: u64, now: u64) -> FriendGrant {
+        FriendGrant {
+            pubkey: pubkey_for(secret),
+            byte_limit: 256,
+            expires_at: now + 3600,
+            grant_id: grant_id.to_owned(),
+            issuer: Some(pubkey_for(issuer)),
+        }
+    }
+
+    fn tier_of(store: &Store, hash: &str) -> RetentionTier {
+        store.get(hash).unwrap().unwrap().retention_tier
+    }
+
+    #[tokio::test]
+    async fn a_runtime_owner_key_promotes_a_later_upload() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = open_store(&directory);
+        let state = AppState::new(store.clone(), test_config()).unwrap();
+        let app = router(state.clone());
+        let now = unix_time();
+        let bytes = b"bytes signed by a keeper key added after start-up";
+        let hash = hex::encode(Sha256::digest(bytes));
+
+        // Unknown at construction: the write is refused.
+        let response = app
+            .clone()
+            .oneshot(upload_request(2, bytes, now))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        state
+            .set_owner_keys(vec![pubkey_for(1), pubkey_for(2)])
+            .await
+            .unwrap();
+
+        let response = app
+            .clone()
+            .oneshot(upload_request(2, bytes, now))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(tier_of(&store, &hash), RetentionTier::Owner);
+    }
+
+    #[tokio::test]
+    async fn removing_an_owner_key_demotes_its_claims_at_the_boundary() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = open_store(&directory);
+        let mut config = test_config();
+        config.allowed_pubkeys.push(pubkey_for(2));
+        let state = AppState::new(store.clone(), config).unwrap();
+        let app = router(state.clone());
+        let now = unix_time();
+        let bytes = b"bytes that outlive the key that claimed them";
+        let hash = hex::encode(Sha256::digest(bytes));
+
+        let response = app
+            .clone()
+            .oneshot(upload_request(2, bytes, now))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(tier_of(&store, &hash), RetentionTier::Owner);
+
+        state.set_owner_keys(vec![pubkey_for(1)]).await.unwrap();
+
+        // Removal demotes; the bytes stay, exactly as a configuration change does.
+        assert_eq!(tier_of(&store, &hash), RetentionTier::Guest);
+        assert!(store.get(&hash).unwrap().unwrap().opaque);
+    }
+
+    #[tokio::test]
+    async fn revoking_one_issuers_grants_is_a_set_friend_grants_call() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = open_store(&directory);
+        let now = unix_time();
+        let mut config = test_config();
+        let revoked = friend_grant(2, "invite-from-the-keeper", 1, now);
+        let kept = friend_grant(3, "invite-from-another-keeper", 4, now);
+        config.friend_grants = vec![revoked, kept.clone()];
+        let state = AppState::new(store.clone(), config).unwrap();
+        let app = router(state.clone());
+
+        let revoked_bytes = b"sheltered under the keeper's own invite";
+        let revoked_hash = hex::encode(Sha256::digest(revoked_bytes));
+        let kept_bytes = b"sheltered under a different issuer's invite";
+        let kept_hash = hex::encode(Sha256::digest(kept_bytes));
+        for (secret, bytes) in [
+            (2_u64, revoked_bytes.as_slice()),
+            (3, kept_bytes.as_slice()),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(upload_request(secret, bytes, now))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CREATED);
+        }
+        assert_eq!(tier_of(&store, &revoked_hash), RetentionTier::Friend);
+        assert_eq!(tier_of(&store, &kept_hash), RetentionTier::Friend);
+
+        // Revoking every grant issued by key 1 is one set_friend_grants call.
+        state.set_friend_grants(vec![kept]).await.unwrap();
+
+        assert_eq!(tier_of(&store, &revoked_hash), RetentionTier::Guest);
+        assert_eq!(tier_of(&store, &kept_hash), RetentionTier::Friend);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_policy_change_waits_for_an_in_flight_upload() {
+        use std::time::Duration;
+
+        let directory = tempfile::tempdir().unwrap();
+        let store = open_store(&directory);
+        let state = AppState::new(store.clone(), test_config()).unwrap();
+        let app = router(state.clone());
+        let now = unix_time();
+
+        let head = Bytes::from_static(b"the first chunk, then the stream stalls; ");
+        let tail = Bytes::from_static(b"and the last chunk arrives at our leisure");
+        let bytes = [head.as_ref(), tail.as_ref()].concat();
+        let hash = hex::encode(Sha256::digest(&bytes));
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let body = futures_util::stream::once(async move { Ok::<Bytes, std::io::Error>(head) })
+            .chain(futures_util::stream::once(async move {
+                // Polled only once the handler holds its write permit and has
+                // written the first chunk: the upload is now mid-stream.
+                let _ = started_tx.send(());
+                let _ = release_rx.await;
+                Ok(tail)
+            }));
+        let request = Request::builder()
+            .method(Method::PUT)
+            .uri("/upload")
+            .header(CONTENT_TYPE, "text/plain")
+            .header(CONTENT_LENGTH, bytes.len())
+            .header(&X_SHA_256, &hash)
+            .header(
+                AUTHORIZATION,
+                operation_authorization_for(1, Some(&hash), now, "upload"),
+            )
+            .body(Body::from_stream(body))
+            .unwrap();
+        let streaming = app.clone();
+        let upload = tokio::spawn(async move { streaming.oneshot(request).await.unwrap() });
+        started_rx.await.unwrap();
+
+        let policy_state = state.clone();
+        let mut policy_change = tokio::spawn(async move {
+            policy_state
+                .set_owner_keys(vec![pubkey_for(1), pubkey_for(2)])
+                .await
+        });
+        // The reconcile boundary is never crossed while a write is in flight.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut policy_change)
+                .await
+                .is_err()
+        );
+
+        // Nor can a new write start: the waiting boundary holds every permit
+        // a release could hand out, so the second upload is shed, not admitted
+        // under a policy that is halfway through changing.
+        let response = app
+            .clone()
+            .oneshot(upload_request(
+                1,
+                b"a write that arrives at the boundary",
+                now,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+
+        release_tx.send(()).unwrap();
+        let response = upload.await.unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        policy_change.await.unwrap().unwrap();
+
+        // The in-flight upload kept the tier decided when it started.
+        assert_eq!(tier_of(&store, &hash), RetentionTier::Owner);
+        let descriptor: serde_json::Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(descriptor["type"], "text/plain");
+    }
+
+    #[tokio::test]
+    async fn an_invalid_runtime_policy_is_refused_and_leaves_the_live_policy_untouched() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = open_store(&directory);
+        let now = unix_time();
+        let mut config = test_config();
+        config.friend_grants = vec![friend_grant(3, "invite-a", 1, now)];
+        let state = AppState::new(store.clone(), config).unwrap();
+        let app = router(state.clone());
+
+        assert!(matches!(
+            state.set_owner_keys(vec!["not-a-public-key".into()]).await,
+            Err(BlossomConfigError::InvalidWriterPubkey)
+        ));
+        // A key cannot be an owner and hold a friend grant at once, exactly as
+        // at construction, so promoting a friend is two ordered calls.
+        assert!(matches!(
+            state
+                .set_owner_keys(vec![pubkey_for(1), pubkey_for(3)])
+                .await,
+            Err(BlossomConfigError::InvalidFriendGrant)
+        ));
+        assert!(matches!(
+            state
+                .set_friend_grants(vec![FriendGrant {
+                    byte_limit: 0,
+                    ..friend_grant(2, "invite-b", 1, now)
+                }])
+                .await,
+            Err(BlossomConfigError::InvalidFriendGrant)
+        ));
+        assert!(matches!(
+            state
+                .set_friend_grants(vec![FriendGrant {
+                    issuer: Some("not-a-public-key".into()),
+                    ..friend_grant(2, "invite-b", 1, now)
+                }])
+                .await,
+            Err(BlossomConfigError::InvalidFriendGrant)
+        ));
+
+        // Nothing moved: the configured owner still writes, key 2 still cannot,
+        // and the untouched grant still admits key 3.
+        let response = app
+            .clone()
+            .oneshot(upload_request(1, b"owner bytes", now))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let response = app
+            .clone()
+            .oneshot(upload_request(2, b"stranger bytes", now))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let friend_bytes = b"invited bytes";
+        let response = app
+            .clone()
+            .oneshot(upload_request(3, friend_bytes, now))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        assert_eq!(
+            tier_of(&store, &hex::encode(Sha256::digest(friend_bytes))),
+            RetentionTier::Friend
         );
     }
 

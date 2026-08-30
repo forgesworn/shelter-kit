@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.0 - 2026-08-30
+
+- Supply the owner set and the friend grants at runtime through
+  `AppState::set_owner_keys` and `AppState::set_friend_grants`, applied at a
+  reconcile boundary that never lands mid-stream against an in-flight upload
+  (joint core contract 0.2 §3).
+- Add `FriendGrant::issuer`, so revoking every grant from one issuer is a
+  single `set_friend_grants` call.
+- Add `AppState::reconcile_now` and `BlossomConfigError::Task`.
+
 ## 0.1.2 - 2026-08-29
 
 - Accept standard base64 in BUD-11 authorisation, not only url-safe. BUD-01
