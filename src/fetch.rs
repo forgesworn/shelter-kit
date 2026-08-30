@@ -125,6 +125,22 @@ pub enum FetchConfigError {
     Client(#[from] reqwest::Error),
 }
 
+/// Installs the process-wide rustls `CryptoProvider` as ring, once, unless
+/// something installed one first.
+///
+/// reqwest here is built with `rustls-no-provider`, so the process provider
+/// decides which TLS backend serves HTTP fetches.  Installing ring keeps a
+/// node to one provider end to end: a node that also carries ForgeSworn Link
+/// already links ring through quinn/rustls, and a second provider in the same
+/// binary costs ~380 KiB and a class of `CryptoProvider` panics in anything
+/// else that expects one to be installed (joint core ledger, finding 15).
+/// `install_default` is first-come: a host that deliberately installed
+/// another provider before building a fetcher wins, and the failure here is
+/// ignored by design.
+fn ensure_crypto_provider() {
+    let _ = rustls::crypto::ring::default_provider().install_default();
+}
+
 /// HTTP fetcher for public HTTPS origins without Tor or another proxy.
 ///
 /// Redirects and ambient system proxies are disabled.  DNS resolution is
@@ -140,6 +156,7 @@ pub struct DirectHttpsFetcher {
 impl DirectHttpsFetcher {
     /// Builds a direct fetcher which accepts only public `https://` origins.
     pub fn new() -> Result<Self, FetchConfigError> {
+        ensure_crypto_provider();
         let client = reqwest::Client::builder()
             .no_proxy()
             .https_only(true)
@@ -294,6 +311,7 @@ impl TorHttpFetcher {
             return Err(FetchConfigError::UnsafeProxy);
         }
         let proxy = reqwest::Proxy::all(proxy_url.as_str())?;
+        ensure_crypto_provider();
         let client = reqwest::Client::builder()
             .proxy(proxy)
             .redirect(reqwest::redirect::Policy::none())

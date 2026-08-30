@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.2 - 2026-08-30
+
+- Build reqwest with `rustls-no-provider` and install ring as the process
+  CryptoProvider in the fetch adapters, so a node carries exactly one TLS
+  backend end to end (joint core ledger, finding 15).  A host that installs
+  another provider first still wins: install_default is first-come.
+
 ## 0.2.0 - 2026-08-30
 
 - Supply the storage quota at runtime through `AppState::set_quota`, applied
