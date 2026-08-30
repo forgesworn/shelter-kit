@@ -186,6 +186,9 @@ struct BlobDescriptor {
     #[serde(rename = "type")]
     content_type: String,
     uploaded: u64,
+    /// The shell's own label for this copy, or `null` for its default.  An
+    /// extra field beside BUD-02's; joint core contract 0.2 §5.
+    class: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -279,6 +282,7 @@ impl Policy {
         &self,
         signer_pubkey: &str,
         declared_type: &str,
+        class: Option<String>,
         now: u64,
     ) -> Result<ClaimSpec, ApiError> {
         if self.owner_pubkeys.contains(signer_pubkey) {
@@ -289,6 +293,7 @@ impl Policy {
                 grant_id: None,
                 claim_expires_at: None,
                 byte_limit: None,
+                class,
             });
         }
         let grant = self
@@ -305,10 +310,16 @@ impl Policy {
             grant_id: Some(grant.grant_id.clone()),
             claim_expires_at: Some(grant.expires_at),
             byte_limit: Some(grant.byte_limit),
+            class,
         })
     }
 
-    fn guest_claim(&self, signer_pubkey: &str, declared_type: &str) -> Result<ClaimSpec, ApiError> {
+    fn guest_claim(
+        &self,
+        signer_pubkey: &str,
+        declared_type: &str,
+        class: Option<String>,
+    ) -> Result<ClaimSpec, ApiError> {
         if !self.open_shelter {
             return Err(ApiError::forbidden("open shelter is disabled"));
         }
@@ -319,6 +330,7 @@ impl Policy {
             grant_id: None,
             claim_expires_at: None,
             byte_limit: None,
+            class,
         })
     }
 }
@@ -716,7 +728,15 @@ async fn upload(
         .trusted_auth
         .verify_upload(authorization, &expected_hash, unix_time())
         .map_err(ApiError::from_auth)?;
-    let claim = policy.trusted_claim(&verified.owner_pubkey, &content_type, unix_time())?;
+    let claim = policy.trusted_claim(
+        &verified.owner_pubkey,
+        &content_type,
+        verified.class,
+        unix_time(),
+    )?;
+    // The store normalises the class the same way the event parser does, so
+    // the descriptor reports exactly what was recorded.
+    let claim_class = claim.class.clone();
     let _write_permit = state
         .inner
         .write_slots
@@ -734,7 +754,7 @@ async fn upload(
 
     match started {
         UploadStart::Existing(metadata) => {
-            let descriptor = descriptor(&state, metadata);
+            let descriptor = descriptor(&state, metadata, claim_class);
             Ok((StatusCode::OK, Json(descriptor)).into_response())
         }
         UploadStart::Reserved(reservation) => {
@@ -779,7 +799,7 @@ async fn upload(
                 .await
                 .map_err(|_| ApiError::internal())?
                 .map_err(ApiError::from_store)?;
-            let descriptor = descriptor(&state, metadata);
+            let descriptor = descriptor(&state, metadata, claim_class);
             Ok((StatusCode::CREATED, Json(descriptor)).into_response())
         }
     }
@@ -812,7 +832,12 @@ async fn upload_preflight(
         .trusted_auth
         .verify_upload(authorization, expected_hash, unix_time())
         .map_err(ApiError::from_auth)?;
-    let claim = policy.trusted_claim(&verified.owner_pubkey, content_type, unix_time())?;
+    let claim = policy.trusted_claim(
+        &verified.owner_pubkey,
+        content_type,
+        verified.class,
+        unix_time(),
+    )?;
     let store = state.inner.store.clone();
     let expected_hash = expected_hash.to_owned();
     spawn_blocking(move || store.check_claimed_upload(&expected_hash, expected_size, &claim))
@@ -859,6 +884,7 @@ async fn mirror(
                 let claim = policy.trusted_claim(
                     &verified.owner_pubkey,
                     "application/octet-stream",
+                    verified.class.clone(),
                     now,
                 )?;
                 (verified, claim)
@@ -869,8 +895,11 @@ async fn mirror(
                     .public_auth
                     .verify_upload(authorization, &expected_hash, now)
                     .map_err(ApiError::from_auth)?;
-                let claim =
-                    policy.guest_claim(&verified.owner_pubkey, "application/octet-stream")?;
+                let claim = policy.guest_claim(
+                    &verified.owner_pubkey,
+                    "application/octet-stream",
+                    verified.class.clone(),
+                )?;
                 (verified, claim)
             }
             Err(error) => return Err(ApiError::from_auth(error)),
@@ -902,6 +931,7 @@ async fn mirror(
         .unwrap_or("application/octet-stream")
         .to_owned();
     claim.declared_type = content_type;
+    let claim_class = claim.class.clone();
 
     let store = state.inner.store.clone();
     let begin_hash = expected_hash.clone();
@@ -915,7 +945,7 @@ async fn mirror(
     match started {
         UploadStart::Existing(metadata) => {
             record_repair_source(&state, &metadata.sha256, &source_url).await?;
-            let descriptor = descriptor(&state, metadata);
+            let descriptor = descriptor(&state, metadata, claim_class);
             Ok((StatusCode::OK, Json(descriptor)).into_response())
         }
         UploadStart::Reserved(reservation) => {
@@ -968,7 +998,7 @@ async fn mirror(
                 .map_err(ApiError::from_store)?;
             record_repair_source(&state, &metadata.sha256, &source_url).await?;
             tracing::info!(hash = %metadata.sha256, %path, "mirrored blob from a verified source");
-            let descriptor = descriptor(&state, metadata);
+            let descriptor = descriptor(&state, metadata, claim_class);
             Ok((StatusCode::CREATED, Json(descriptor)).into_response())
         }
     }
@@ -1181,7 +1211,7 @@ fn is_safe_mirror_host(host: &str, onion: bool) -> bool {
     })
 }
 
-fn descriptor(state: &AppState, metadata: BlobMetadata) -> BlobDescriptor {
+fn descriptor(state: &AppState, metadata: BlobMetadata, class: Option<String>) -> BlobDescriptor {
     let extension = extension_for(&metadata.content_type);
     let url = format!(
         "{}/{}.{}",
@@ -1195,6 +1225,7 @@ fn descriptor(state: &AppState, metadata: BlobMetadata) -> BlobDescriptor {
         size: metadata.size,
         content_type: metadata.content_type,
         uploaded: metadata.uploaded,
+        class,
     }
 }
 
@@ -1212,6 +1243,7 @@ fn descriptor_for_claim(state: &AppState, claim: ClaimMetadata) -> BlobDescripto
         size: claim.size,
         content_type: claim.content_type,
         uploaded: claim.uploaded,
+        class: claim.class,
     }
 }
 
@@ -1492,6 +1524,16 @@ mod tests {
         created_at: u64,
         operation: &str,
     ) -> String {
+        classed_authorization(secret, hash, created_at, operation, &[])
+    }
+
+    fn classed_authorization(
+        secret: u64,
+        hash: Option<&str>,
+        created_at: u64,
+        operation: &str,
+        classes: &[&str],
+    ) -> String {
         let keys = Keys::parse(&format!("{secret:064x}")).unwrap();
         let mut tags = vec![
             Tag::parse(["t", operation]).unwrap(),
@@ -1499,6 +1541,9 @@ mod tests {
         ];
         if let Some(hash) = hash {
             tags.push(Tag::parse(["x", hash]).unwrap());
+        }
+        for class in classes {
+            tags.push(Tag::parse(["class", class]).unwrap());
         }
         tags.push(Tag::parse(["expiration", &(created_at + 120).to_string()]).unwrap());
         let event = EventBuilder::new(Kind::Custom(24_242), format!("Authorise {operation}"))
@@ -2168,6 +2213,15 @@ mod tests {
     }
 
     fn upload_request(secret: u64, bytes: &[u8], now: u64) -> Request<Body> {
+        classed_upload_request(secret, bytes, now, &[])
+    }
+
+    fn classed_upload_request(
+        secret: u64,
+        bytes: &[u8],
+        now: u64,
+        classes: &[&str],
+    ) -> Request<Body> {
         let hash = hex::encode(Sha256::digest(bytes));
         Request::builder()
             .method(Method::PUT)
@@ -2177,10 +2231,42 @@ mod tests {
             .header(&X_SHA_256, &hash)
             .header(
                 AUTHORIZATION,
-                operation_authorization_for(secret, Some(&hash), now, "upload"),
+                classed_authorization(secret, Some(&hash), now, "upload", classes),
             )
             .body(Body::from(bytes.to_vec()))
             .unwrap()
+    }
+
+    /// Every listed descriptor for `secret`, as `hash -> class`.
+    async fn listed_classes(
+        app: &Router,
+        secret: u64,
+        now: u64,
+    ) -> BTreeMap<String, serde_json::Value> {
+        let request = Request::builder()
+            .uri(format!("/list/{}?limit=100", pubkey_for(secret)))
+            .header(
+                AUTHORIZATION,
+                operation_authorization_for(secret, None, now, "list"),
+            )
+            .body(Body::empty())
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let listed: serde_json::Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        listed
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|descriptor| {
+                (
+                    descriptor["sha256"].as_str().unwrap().to_owned(),
+                    descriptor["class"].clone(),
+                )
+            })
+            .collect()
     }
 
     fn friend_grant(secret: u64, grant_id: &str, issuer: u64, now: u64) -> FriendGrant {
@@ -2439,6 +2525,100 @@ mod tests {
             tier_of(&store, &hex::encode(Sha256::digest(friend_bytes))),
             RetentionTier::Friend
         );
+    }
+
+    #[tokio::test]
+    async fn an_upload_class_tag_round_trips_into_list_descriptors() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = open_store(&directory);
+        let app = router(AppState::new(store.clone(), test_config()).unwrap());
+        let now = unix_time();
+
+        let classed = b"a copy the shell calls vital";
+        let plain = b"a copy the shell says nothing about";
+        let shouty = b"a copy with a class outside the bound";
+        let doubled = b"a copy with two class tags";
+        for (bytes, classes) in [
+            (classed.as_slice(), ["vital"].as_slice()),
+            (plain.as_slice(), [].as_slice()),
+            (shouty.as_slice(), ["VITAL"].as_slice()),
+            (doubled.as_slice(), ["vital", "working"].as_slice()),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(classed_upload_request(1, bytes, now, classes))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CREATED);
+        }
+
+        let hash_of = |bytes: &[u8]| hex::encode(Sha256::digest(bytes));
+        let listed = listed_classes(&app, 1, now).await;
+        assert_eq!(listed[&hash_of(classed)], serde_json::json!("vital"));
+        assert_eq!(listed[&hash_of(plain)], serde_json::Value::Null);
+        // Out of bounds and ambiguous both read as absent, never as an error.
+        assert_eq!(listed[&hash_of(shouty)], serde_json::Value::Null);
+        assert_eq!(listed[&hash_of(doubled)], serde_json::Value::Null);
+
+        // Two uploads that differ only in their class are the same to the core.
+        for bytes in [classed.as_slice(), plain.as_slice()] {
+            assert_eq!(tier_of(&store, &hash_of(bytes)), RetentionTier::Owner);
+        }
+
+        // And nothing about a class reaches a reader.
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/{}", hash_of(classed)))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        for (name, value) in response.headers() {
+            assert!(!name.as_str().contains("class"), "{name} names a class");
+            assert!(
+                !value.to_str().unwrap_or_default().contains("vital"),
+                "{name} carries a class"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_mirror_carries_the_class_from_its_authorising_event() {
+        let directory = tempfile::tempdir().unwrap();
+        let bytes = b"bytes pulled in under a named class";
+        let hash = hex::encode(Sha256::digest(bytes));
+        let state = AppState::with_fetcher(
+            open_store(&directory),
+            test_config(),
+            FakeFetcher::serving(bytes),
+        )
+        .unwrap();
+        let app = router(state);
+        let now = unix_time();
+
+        let request = Request::builder()
+            .method(Method::PUT)
+            .uri("/mirror")
+            .header(CONTENT_TYPE, "application/json")
+            .header(
+                AUTHORIZATION,
+                classed_authorization(1, Some(&hash), now, "upload", &["circle"]),
+            )
+            .body(Body::from(format!(
+                r#"{{"url":"https://origin.example/{hash}"}}"#
+            )))
+            .unwrap();
+        let response = app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let descriptor: serde_json::Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(descriptor["class"], "circle");
+        assert_eq!(listed_classes(&app, 1, now).await[&hash], "circle");
     }
 
     #[test]

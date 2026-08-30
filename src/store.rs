@@ -54,6 +54,15 @@ pub struct ClaimSpec {
     pub grant_id: Option<String>,
     pub claim_expires_at: Option<u64>,
     pub byte_limit: Option<u64>,
+    /// The shell's own label for this copy, from a `class` tag on the
+    /// authorising event or pin.  `None` means "the shell's default".
+    ///
+    /// The core stores it, returns it in list descriptors and does nothing
+    /// else with it: it MUST NOT influence the retention tier, eviction or
+    /// serving (joint core contract 0.2 §3).  The bound is 1 to 32 bytes of
+    /// `[a-z0-9-]`; a value outside it is recorded as absent rather than
+    /// refused, because the label carries no authority.
+    pub class: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -83,6 +92,7 @@ pub struct ClaimMetadata {
     #[serde(rename = "type")]
     pub content_type: String,
     pub uploaded: u64,
+    pub class: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -303,6 +313,7 @@ impl Store {
                 grant_id: None,
                 claim_expires_at: None,
                 byte_limit: None,
+                class: None,
             },
         )
     }
@@ -311,8 +322,12 @@ impl Store {
         &self,
         expected_hash: &str,
         expected_size: u64,
-        claim: ClaimSpec,
+        mut claim: ClaimSpec,
     ) -> Result<UploadStart, StoreError> {
+        // The class is advisory, so it is normalised, never rejected: an
+        // out-of-bounds label becomes the shell's default rather than a
+        // failed write.
+        claim.class = normalised_class(claim.class.as_deref());
         validate_hash(expected_hash)?;
         validate_claim(&claim)?;
         self.reap_expired_claims()?;
@@ -383,8 +398,8 @@ impl Store {
         transaction.execute(
             "INSERT INTO reservations
              (id, hash, size, retention_tier, signer_pubkey, declared_type,
-              grant_id, claim_expires_at, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+              grant_id, claim_expires_at, class, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 id,
                 expected_hash,
@@ -398,6 +413,7 @@ impl Store {
                     .map(i64::try_from)
                     .transpose()
                     .map_err(|_| StoreError::IntegerRange)?,
+                claim.class,
                 now
             ],
         )?;
@@ -426,6 +442,7 @@ impl Store {
                 grant_id: None,
                 claim_expires_at: None,
                 byte_limit: None,
+                class: None,
             },
         )
     }
@@ -567,7 +584,7 @@ impl Store {
             None => None,
         };
         let mut statement = connection.prepare(
-            "SELECT c.hash, c.created_at
+            "SELECT c.hash, c.created_at, c.class
              FROM claims c
              WHERE c.signer_pubkey = ?1
                AND (c.claim_expires_at IS NULL OR c.claim_expires_at > ?2)
@@ -583,17 +600,24 @@ impl Store {
                 cursor.unwrap_or(""),
                 i64::try_from(limit).map_err(|_| StoreError::IntegerRange)?
             ],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
         )?;
         let mut claims = Vec::new();
         for row in rows {
-            let (hash, uploaded) = row?;
+            let (hash, uploaded, class) = row?;
             let metadata = query_blob(&connection, &hash)?.ok_or(StoreError::MissingBlob)?;
             claims.push(ClaimMetadata {
                 sha256: hash,
                 size: metadata.size,
                 content_type: metadata.content_type,
                 uploaded: u64::try_from(uploaded).map_err(|_| StoreError::IntegerRange)?,
+                class,
             });
         }
         Ok(claims)
@@ -982,6 +1006,7 @@ impl Store {
                 declared_type TEXT NOT NULL,
                 grant_id TEXT,
                 claim_expires_at INTEGER,
+                class TEXT,
                 created_at INTEGER NOT NULL
              );
              CREATE TABLE IF NOT EXISTS repair_sources (
@@ -996,9 +1021,17 @@ impl Store {
                 ON claims(signer_pubkey, created_at DESC, hash);
              CREATE INDEX IF NOT EXISTS reservations_signer
                 ON reservations(signer_pubkey, retention_tier);
-             PRAGMA user_version = 2;
              COMMIT;",
         )?;
+        // 0.2 -> 0.3: a nullable, advisory `class` on every claim.  Adding a
+        // column keeps every blob and claim in place, so this is a compatible
+        // migration; guarding on the column rather than on `user_version`
+        // makes it idempotent from either version.  Reservations never survive
+        // a restart, so their column arrives with the table above.
+        if !column_exists(&connection, "claims", "class")? {
+            connection.execute("ALTER TABLE claims ADD COLUMN class TEXT", [])?;
+        }
+        connection.execute_batch("PRAGMA user_version = 3;")?;
         set_private_file_permissions(&self.database_path)?;
         Ok(())
     }
@@ -1314,13 +1347,14 @@ fn upsert_claim(
     connection.execute(
         "INSERT INTO claims
          (hash, signer_pubkey, retention_tier, declared_type,
-          grant_id, claim_expires_at, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+          grant_id, claim_expires_at, class, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
          ON CONFLICT(signer_pubkey, hash) DO UPDATE SET
            retention_tier = excluded.retention_tier,
            declared_type = excluded.declared_type,
            grant_id = excluded.grant_id,
            claim_expires_at = excluded.claim_expires_at,
+           class = excluded.class,
            created_at = excluded.created_at",
         params![
             hash,
@@ -1333,6 +1367,7 @@ fn upsert_claim(
                 .map(i64::try_from)
                 .transpose()
                 .map_err(|_| StoreError::IntegerRange)?,
+            normalised_class(claim.class.as_deref()),
             created_at
         ],
     )?;
@@ -1405,6 +1440,32 @@ fn query_blob_row(
         .transpose()
 }
 
+fn column_exists(connection: &Connection, table: &str, column: &str) -> Result<bool, StoreError> {
+    let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+    let mut found = false;
+    let rows = statement.query_map([], |row| row.get::<_, String>(1))?;
+    for row in rows {
+        found |= row? == column;
+    }
+    Ok(found)
+}
+
+/// The bound on a claim or reservation `class`: 1 to 32 bytes of `[a-z0-9-]`.
+///
+/// Anything else -- an empty value, an over-long one, any other character --
+/// is absent rather than an error.  The tag is advisory to the core: it never
+/// decides retention, so refusing a write over a label the core does not act
+/// on would fail a good upload for nothing, and a shell that cares can read
+/// back the null in the list descriptor.
+pub(crate) fn normalised_class(class: Option<&str>) -> Option<String> {
+    let class = class?;
+    let bounded = (1..=32).contains(&class.len())
+        && class
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
+    bounded.then(|| class.to_owned())
+}
+
 fn validate_hash(hash: &str) -> Result<(), StoreError> {
     if hash.len() != 64 || !hash.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return Err(StoreError::InvalidHash);
@@ -1449,7 +1510,7 @@ fn set_private_file_permissions(path: &Path) -> Result<(), StoreError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
+    use std::{collections::BTreeMap, io::Write};
 
     fn test_store(quota: u64, max_blob: u64) -> (tempfile::TempDir, Store) {
         let directory = tempfile::tempdir().unwrap();
@@ -1470,6 +1531,7 @@ mod tests {
             grant_id: None,
             claim_expires_at: None,
             byte_limit: None,
+            class: None,
         }
     }
 
@@ -1481,6 +1543,7 @@ mod tests {
             grant_id: None,
             claim_expires_at: None,
             byte_limit: None,
+            class: None,
         }
     }
 
@@ -1492,7 +1555,13 @@ mod tests {
             grant_id: Some(format!("grant-{signer}")),
             claim_expires_at: Some(expires_at),
             byte_limit: Some(byte_limit),
+            class: None,
         }
+    }
+
+    fn with_class(mut claim: ClaimSpec, class: Option<&str>) -> ClaimSpec {
+        claim.class = class.map(str::to_owned);
+        claim
     }
 
     fn store_claim(store: &Store, bytes: &[u8], claim: ClaimSpec) -> String {
@@ -1508,6 +1577,194 @@ mod tests {
             }
         }
         hash
+    }
+
+    /// The 0.2 schema, exactly as `shelter-kit` 0.1.2 wrote it: no `class`
+    /// column anywhere and `user_version = 2`.
+    const VERSION_TWO_SCHEMA: &str = "
+        CREATE TABLE blobs (
+            hash TEXT PRIMARY KEY NOT NULL,
+            size INTEGER NOT NULL CHECK (size >= 0),
+            content_type TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        );
+        CREATE TABLE claims (
+            hash TEXT NOT NULL REFERENCES blobs(hash) ON DELETE CASCADE,
+            signer_pubkey TEXT NOT NULL,
+            retention_tier TEXT NOT NULL
+                CHECK (retention_tier IN ('owner', 'friend', 'guest')),
+            declared_type TEXT NOT NULL,
+            grant_id TEXT,
+            claim_expires_at INTEGER,
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY (signer_pubkey, hash)
+        );
+        CREATE TABLE reservations (
+            id TEXT PRIMARY KEY NOT NULL,
+            hash TEXT NOT NULL,
+            size INTEGER NOT NULL CHECK (size >= 0),
+            retention_tier TEXT NOT NULL
+                CHECK (retention_tier IN ('owner', 'friend', 'guest')),
+            signer_pubkey TEXT NOT NULL,
+            declared_type TEXT NOT NULL,
+            grant_id TEXT,
+            claim_expires_at INTEGER,
+            created_at INTEGER NOT NULL
+        );
+        CREATE TABLE repair_sources (
+            hash TEXT NOT NULL REFERENCES blobs(hash) ON DELETE CASCADE,
+            source_url TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            PRIMARY KEY (hash, source_url)
+        );
+        PRAGMA user_version = 2;
+    ";
+
+    fn user_version(root: &Path) -> i64 {
+        Connection::open(root.join("wildbloom.sqlite3"))
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    #[test]
+    fn a_version_two_database_migrates_to_a_null_claim_class() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("data");
+        let bytes = b"stored before the class column existed";
+        let hash = hex::encode(Sha256::digest(bytes));
+        let signer = "01".repeat(32);
+        fs::create_dir_all(root.join("blobs").join(&hash[..2])).unwrap();
+        fs::create_dir_all(root.join("tmp")).unwrap();
+        fs::write(root.join("blobs").join(&hash[..2]).join(&hash), bytes).unwrap();
+        {
+            let connection = Connection::open(root.join("wildbloom.sqlite3")).unwrap();
+            connection.execute_batch(VERSION_TWO_SCHEMA).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO blobs (hash, size, content_type, created_at)
+                     VALUES (?1, ?2, 'text/plain', 1)",
+                    params![hash, bytes.len() as i64],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO claims
+                     (hash, signer_pubkey, retention_tier, declared_type,
+                      grant_id, claim_expires_at, created_at)
+                     VALUES (?1, ?2, 'owner', 'text/plain', NULL, NULL, 1)",
+                    params![hash, signer],
+                )
+                .unwrap();
+        }
+        assert_eq!(user_version(&root), 2);
+
+        let config = StoreConfig {
+            root: root.clone(),
+            quota_bytes: 1024,
+            max_blob_bytes: 1024,
+        };
+        let store = Store::open(config.clone()).unwrap();
+        let claims = store.list_claims(&signer, None, 10).unwrap();
+        assert_eq!(claims.len(), 1);
+        assert_eq!(claims[0].sha256, hash);
+        assert_eq!(claims[0].class, None);
+        assert_eq!(user_version(&root), 3);
+
+        // Idempotent: opening a migrated store again changes nothing.
+        drop(store);
+        let store = Store::open(config).unwrap();
+        assert_eq!(store.list_claims(&signer, None, 10).unwrap()[0].class, None);
+        assert_eq!(user_version(&root), 3);
+    }
+
+    #[test]
+    fn class_changes_neither_the_retention_tier_nor_the_eviction_order() {
+        let (_directory, store) = test_store(100, 100);
+        let classed = store_claim(
+            &store,
+            &[b'a'; 14],
+            with_class(guest_claim("guest-one"), Some("vital")),
+        );
+        let plain = store_claim(&store, &[b'g'; 14], guest_claim("guest-two"));
+        // A class on a guest claim does not promote it.
+        for hash in [&classed, &plain] {
+            assert_eq!(
+                store.get(hash).unwrap().unwrap().retention_tier,
+                RetentionTier::Guest
+            );
+        }
+
+        let connection = store.connection().unwrap();
+        connection
+            .execute(
+                "UPDATE blobs SET created_at = 1 WHERE hash = ?1",
+                [&classed],
+            )
+            .unwrap();
+        connection
+            .execute("UPDATE blobs SET created_at = 2 WHERE hash = ?1", [&plain])
+            .unwrap();
+        drop(connection);
+
+        // An owner write that needs 13 bytes back evicts exactly one guest:
+        // the oldest.  The strongest-sounding class in the store is on it, and
+        // it goes first anyway.
+        let owner_bytes = [b'o'; 65];
+        let owner_hash = store_claim(
+            &store,
+            &owner_bytes,
+            with_class(owner_claim("keeper", "audio/mpeg"), Some("vital")),
+        );
+        assert!(store.get(&classed).unwrap().is_none());
+        assert!(store.get(&plain).unwrap().is_some());
+        // Nor does a class on an owner claim change that claim's own tier.
+        assert_eq!(
+            store.get(&owner_hash).unwrap().unwrap().retention_tier,
+            RetentionTier::Owner
+        );
+    }
+
+    #[test]
+    fn a_class_outside_the_bound_is_stored_as_absent() {
+        let (_directory, store) = test_store(1024, 1024);
+        let signer = "01".repeat(32);
+        let cases: [(&[u8], Option<&str>, Option<&str>); 6] = [
+            (b"within the bound", Some("working"), Some("working")),
+            (
+                b"digits and dashes",
+                Some("ken-of-kith-2"),
+                Some("ken-of-kith-2"),
+            ),
+            (b"no tag at all", None, None),
+            (b"upper case is out of bounds", Some("Working"), None),
+            (b"an empty value is out of bounds", Some(""), None),
+            (b"punctuation is out of bounds", Some("working!"), None),
+        ];
+        let mut expected = BTreeMap::new();
+        for (bytes, class, want) in cases {
+            let hash = store_claim(
+                &store,
+                bytes,
+                with_class(owner_claim(&signer, "text/plain"), class),
+            );
+            expected.insert(hash, want.map(str::to_owned));
+        }
+        // A value longer than 32 bytes is out of bounds too.
+        let long = store_claim(
+            &store,
+            b"thirty-three characters is too many",
+            with_class(owner_claim(&signer, "text/plain"), Some(&"a".repeat(33))),
+        );
+        expected.insert(long, None);
+
+        let listed = store
+            .list_claims(&signer, None, 100)
+            .unwrap()
+            .into_iter()
+            .map(|claim| (claim.sha256, claim.class))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(listed, expected);
     }
 
     #[test]
