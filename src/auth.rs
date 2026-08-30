@@ -7,6 +7,7 @@ use nostr::prelude::Event;
 use serde::Deserialize;
 use std::{collections::BTreeSet, time::Duration};
 use thiserror::Error;
+use url::Url;
 
 const BLOSSOM_AUTH_KIND: u16 = 24_242;
 const MAX_AUTH_BYTES: usize = 16 * 1024;
@@ -14,7 +15,7 @@ const MAX_CONTENT_BYTES: usize = 1024;
 
 #[derive(Debug, Clone)]
 pub struct AuthPolicy {
-    accepted_servers: BTreeSet<String>,
+    accepted_servers: BTreeSet<ServerName>,
     allowed_pubkeys: BTreeSet<String>,
     allow_public_writes: bool,
     max_event_lifetime: Duration,
@@ -91,7 +92,10 @@ impl AuthPolicy {
             accepted_servers: servers
                 .into_iter()
                 .map(Into::into)
-                .map(|server| server.to_ascii_lowercase())
+                // Configured names tolerate careless case; a `server` tag on
+                // the wire does not (BUD-11 requires a lowercase host), so
+                // lower-casing happens only on this, the configuration side.
+                .filter_map(|server| server_name(&server.to_ascii_lowercase()))
                 .collect(),
             allowed_pubkeys: BTreeSet::new(),
             allow_public_writes: false,
@@ -213,13 +217,19 @@ impl AuthPolicy {
             }
         }
         let servers = scoped_tags(&raw.tags, "server")?;
-        if servers.is_empty()
-            || servers.iter().any(|server| !is_domain_name(server))
-            || self.accepted_servers.is_empty()
-            || !servers
-                .iter()
-                .any(|server| self.accepted_servers.contains(*server))
-        {
+        let server_names = servers
+            .iter()
+            .map(|server| server_name(server))
+            .collect::<Option<Vec<_>>>();
+        let accepted = match &server_names {
+            Some(names) if !names.is_empty() => names.iter().any(|name| {
+                self.accepted_servers
+                    .iter()
+                    .any(|accepted| accepted.admits(name))
+            }),
+            _ => false,
+        };
+        if servers.is_empty() || self.accepted_servers.is_empty() || !accepted {
             return Err(AuthError::WrongServer);
         }
         let expires_at = unique_singleton_tag(&raw.tags, "expiration")?
@@ -281,6 +291,78 @@ fn is_canonical_hash(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
+/// A `server` tag's identity, canonicalised the way BUD-11 §4 and joint core
+/// contract item B12 compare it.
+///
+/// A value is well-formed if it is either a bare lowercase domain name
+/// (`node.example`) or an absolute URL with scheme `http` or `https`, a
+/// host, an optional port, and nothing else of significance -- a path of
+/// `/` or empty is allowed, but a query, a fragment or userinfo is not.
+///
+/// A bare name canonicalises to its lowercased host alone; no scheme is
+/// implied, so it is compared by host only, whatever scheme or port the
+/// other side carries. A URL canonicalises to `scheme://host[:port]`, with
+/// the host lowercased and the scheme's default port elided (`:443` for
+/// `https`, `:80` for `http`). Comparing two URLs requires the same
+/// canonical form; comparing a URL against a bare name, in either
+/// direction, compares hosts only.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+enum ServerName {
+    Bare(String),
+    Url {
+        scheme: String,
+        host: String,
+        port: Option<u16>,
+    },
+}
+
+impl ServerName {
+    fn host(&self) -> &str {
+        match self {
+            ServerName::Bare(host) => host,
+            ServerName::Url { host, .. } => host,
+        }
+    }
+
+    /// True when `self`, taken as a configured accepted name, admits `tag`,
+    /// a `server` tag's canonical form, under the matching rule above.
+    fn admits(&self, tag: &ServerName) -> bool {
+        match (self, tag) {
+            (ServerName::Url { .. }, ServerName::Url { .. }) => self == tag,
+            _ => self.host() == tag.host(),
+        }
+    }
+}
+
+/// Parses a `server` tag value (or a configured accepted name) into its
+/// canonical [`ServerName`], or `None` if it is neither a well-formed bare
+/// domain name nor a well-formed `http`/`https` URL.
+fn server_name(value: &str) -> Option<ServerName> {
+    if is_domain_name(value) {
+        return Some(ServerName::Bare(value.to_owned()));
+    }
+    let url = Url::parse(value).ok()?;
+    let scheme = url.scheme();
+    if scheme != "http" && scheme != "https" {
+        return None;
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return None;
+    }
+    if !matches!(url.path(), "" | "/") || url.query().is_some() || url.fragment().is_some() {
+        return None;
+    }
+    let host = url.host_str()?.to_ascii_lowercase();
+    Some(ServerName::Url {
+        scheme: scheme.to_ascii_lowercase(),
+        host,
+        // The `url` crate itself elides a scheme's default port during
+        // parsing, so `:443` on `https` and `:80` on `http` already come
+        // back as `None` here.
+        port: url.port(),
+    })
 }
 
 fn is_domain_name(value: &str) -> bool {
@@ -543,5 +625,108 @@ mod tests {
                 .verify_delete(Some(&delete), &hash, 1_010)
                 .is_ok()
         );
+    }
+
+    #[test]
+    fn a_url_shaped_server_tag_is_accepted() {
+        let hash = "a".repeat(64);
+        let policy = AuthPolicy::new(["https://node.example"]).with_public_writes(true);
+        let mut tags = valid_tags(&hash, 1_120);
+        tags[2][1] = "https://node.example".into();
+        let auth = header(tags, 1_000);
+        assert!(policy.verify_upload(Some(&auth), &hash, 1_010).is_ok());
+    }
+
+    #[test]
+    fn a_bare_host_matches_any_scheme_and_port() {
+        let hash = "a".repeat(64);
+        let policy = AuthPolicy::new(["node.example"]).with_public_writes(true);
+        for tag_value in [
+            "http://node.example:8080",
+            "https://node.example",
+            "node.example",
+        ] {
+            let mut tags = valid_tags(&hash, 1_120);
+            tags[2][1] = tag_value.into();
+            let auth = header(tags, 1_000);
+            assert!(
+                policy.verify_upload(Some(&auth), &hash, 1_010).is_ok(),
+                "expected {tag_value:?} to match the bare accepted name"
+            );
+        }
+    }
+
+    #[test]
+    fn a_url_with_a_path_query_or_userinfo_is_malformed() {
+        let hash = "a".repeat(64);
+        let policy = AuthPolicy::new(["node.example"]).with_public_writes(true);
+        for tag_value in [
+            "https://node.example/blob",
+            "https://node.example/?x=1",
+            "https://node.example/#frag",
+            "https://user@node.example/",
+            "https://user:pass@node.example/",
+        ] {
+            let mut tags = valid_tags(&hash, 1_120);
+            tags[2][1] = tag_value.into();
+            let auth = header(tags, 1_000);
+            assert_eq!(
+                policy.verify_upload(Some(&auth), &hash, 1_010),
+                Err(AuthError::WrongServer),
+                "expected {tag_value:?} to be rejected as malformed"
+            );
+        }
+    }
+
+    #[test]
+    fn a_url_for_another_host_is_wrong_server() {
+        let hash = "a".repeat(64);
+        let policy = AuthPolicy::new(["https://node.example"]).with_public_writes(true);
+        let mut tags = valid_tags(&hash, 1_120);
+        tags[2][1] = "https://attacker.example".into();
+        let auth = header(tags, 1_000);
+        assert_eq!(
+            policy.verify_upload(Some(&auth), &hash, 1_010),
+            Err(AuthError::WrongServer)
+        );
+    }
+
+    #[test]
+    fn default_ports_are_elided_in_the_canonical_form() {
+        let hash = "a".repeat(64);
+
+        let https_policy = AuthPolicy::new(["https://node.example"]).with_public_writes(true);
+        let mut https_tags = valid_tags(&hash, 1_120);
+        https_tags[2][1] = "https://node.example:443".into();
+        let https_auth = header(https_tags, 1_000);
+        assert!(
+            https_policy
+                .verify_upload(Some(&https_auth), &hash, 1_010)
+                .is_ok()
+        );
+
+        let http_policy = AuthPolicy::new(["http://node.example"]).with_public_writes(true);
+        let mut http_tags = valid_tags(&hash, 1_120);
+        http_tags[2][1] = "http://node.example:80".into();
+        let http_auth = header(http_tags, 1_000);
+        assert!(
+            http_policy
+                .verify_upload(Some(&http_auth), &hash, 1_010)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn a_stash_rs_minted_server_tag_is_accepted() {
+        // `stash-rs`'s BUD-11 signer mints `TagStandard::Server(url)` from a
+        // `url::Url`; its serialisation always carries the trailing slash of a
+        // path-less URL, so this is the literal tag value it produces on the
+        // wire against a bare configured name.
+        let hash = "a".repeat(64);
+        let policy = AuthPolicy::new(["node.example"]).with_public_writes(true);
+        let mut tags = valid_tags(&hash, 1_120);
+        tags[2][1] = "https://node.example/".into();
+        let auth = header(tags, 1_000);
+        assert!(policy.verify_upload(Some(&auth), &hash, 1_010).is_ok());
     }
 }

@@ -14,6 +14,11 @@
   never influences the retention tier, eviction or serving (joint core contract
   0.2 §3, §5).  Schema `user_version = 3`: an added column, so every blob and
   claim migrates forward in place.
+- Accept a URL-shaped BUD-11 `server` tag, not only a bare domain, and match
+  it against a configured accepted name of either shape (joint core contract
+  item B12). `rust-nostr`'s `TagStandard::Server` -- and so `stash-rs` --
+  mints a full URL; a node configured with a bare name was rejecting a
+  genuine token outright.
 
 ## 0.1.2 - 2026-08-29
 
