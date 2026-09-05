@@ -15,5 +15,6 @@ pub use fetch::{
 };
 pub use store::{
     BlobMetadata, ClaimMetadata, ClaimSpec, DeleteOutcome, EvictionRecord, IntegrityReport,
-    RepairCandidate, RepairReservation, RetentionTier, Store, StoreConfig, StoreError,
+    RepairCandidate, RepairReservation, RepairSource, RetentionTier, Store, StoreConfig,
+    StoreError,
 };

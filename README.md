@@ -44,6 +44,23 @@ The exact compatibility promise is in [CORE-CONTRACT.md](CORE-CONTRACT.md); the
 joint 0.2 contract this implements is in
 [CORE-CONTRACT-0.2.md](CORE-CONTRACT-0.2.md).
 
+## Added in 0.3.0
+
+- Owner-authenticated listing of another key in the same current owner set.
+  Friends list only claims under their current valid grant; other signed
+  requesters remain self-only. Unsigned listing is refused.
+- Local `Store::last_verified` integrity-scan evidence and
+  `Store::repair_sources` with each source's most recent `verified_at`.
+  Failed scans and fetches never advance a success timestamp.
+- Schema 4 preserves blobs, claims and source URLs. Migrated timestamps start
+  as unknown. Older deduplication hits could record unread remote bodies, so
+  those old URLs are excluded from automatic repair until a caller explicitly
+  fetches, verifies and records them again. A deduplicated mirror does not
+  certify a source; shells using `record_repair_source` must check its bytes.
+
+These implement the agreed contract's listing and verification requirements.
+Shell policy tombstones and optional admission filters remain outstanding.
+
 ## Not implemented here
 
 Shelter Kit does not open a port, run Tor, punch through NAT, provide STUN/TURN,
@@ -56,7 +73,7 @@ moved, not evidence that another machine will retain them.
 
 ```toml
 [dependencies]
-shelter-kit = { git = "https://github.com/forgesworn/shelter-kit", tag = "v0.1.1" }
+shelter-kit = { git = "https://github.com/forgesworn/shelter-kit", tag = "v0.3.0" }
 ```
 
 Create a `Store`, build an `AppState` from a `BlossomConfig`, optionally supply

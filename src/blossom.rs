@@ -674,6 +674,12 @@ async fn try_repair_candidate(
     spawn_blocking(move || repair.commit(&actual_hash, received))
         .await
         .map_err(|_| RepairError::Task)??;
+    let store = state.inner.store.clone();
+    let hash = candidate.sha256.clone();
+    let source = source.to_owned();
+    spawn_blocking(move || store.record_repair_source(&hash, &source))
+        .await
+        .map_err(|_| RepairError::Task)??;
     tracing::info!(hash = %candidate.sha256, %path, "repaired blob from a verified source");
     Ok(true)
 }
@@ -1002,7 +1008,8 @@ async fn mirror(
 
     match started {
         UploadStart::Existing(metadata) => {
-            record_repair_source(&state, &metadata.sha256, &source_url).await?;
+            // Local verified bytes do not establish what this remote body
+            // contains. Dropping it must not create or refresh source evidence.
             let descriptor = descriptor(&state, metadata, claim_class);
             Ok((StatusCode::OK, Json(descriptor)).into_response())
         }
@@ -1096,19 +1103,40 @@ async fn list_blobs(
     let authorization = headers
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok());
-    state
+    let now = unix_time();
+    let verified = state
         .inner
         .public_auth
-        .verify_list(authorization, &pubkey, unix_time())
+        .verify_list_identity(authorization, now)
         .map_err(ApiError::from_auth)?;
+    // Hold the policy read guard through the database read, so a completed
+    // reconcile cannot leave this request using an obsolete owner/grant set.
+    let policy = state.inner.policy.read().await;
+    let requester = &verified.owner_pubkey;
+    let owner_scope =
+        policy.owner_pubkeys.contains(requester) && policy.owner_pubkeys.contains(&pubkey);
+    if requester != &pubkey && !owner_scope {
+        return Err(ApiError::from_auth(AuthError::WrongPubkey));
+    }
+    let grant_id = policy
+        .friend_grants
+        .get(requester)
+        .filter(|grant| grant.expires_at > now)
+        .map(|grant| grant.grant_id.clone());
     let limit = query.limit.unwrap_or(50);
     let cursor = query.cursor;
     let store = state.inner.store.clone();
     let list_pubkey = pubkey;
-    let claims = spawn_blocking(move || store.list_claims(&list_pubkey, cursor.as_deref(), limit))
-        .await
-        .map_err(|_| ApiError::internal())?
-        .map_err(ApiError::from_store)?;
+    let claims = spawn_blocking(move || match grant_id {
+        Some(grant_id) => {
+            store.list_claims_for_grant(&list_pubkey, &grant_id, cursor.as_deref(), limit)
+        }
+        None => store.list_claims(&list_pubkey, cursor.as_deref(), limit),
+    })
+    .await
+    .map_err(|_| ApiError::internal())?
+    .map_err(ApiError::from_store)?;
+    drop(policy);
     Ok(Json(
         claims
             .into_iter()
@@ -1992,6 +2020,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_existing_local_blob_does_not_verify_an_unread_remote_body() {
+        let directory = tempfile::tempdir().unwrap();
+        let bytes = b"locally verified bytes";
+        let hash = hex::encode(Sha256::digest(bytes));
+        let fetcher = FakeFetcher::with(FakeOutcome::Serve {
+            bytes: vec![0; bytes.len()],
+            declared_size: bytes.len() as u64,
+            content_type: None,
+        });
+        let state =
+            AppState::with_fetcher(open_store(&directory), test_config(), fetcher.clone()).unwrap();
+        let app = router(state.clone());
+        assert_eq!(
+            app.clone()
+                .oneshot(upload_request(1, bytes, unix_time()))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CREATED,
+        );
+        assert_eq!(
+            app.oneshot(mirror_request(&hash, unix_time()))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::OK,
+        );
+        std::fs::remove_file(state.store().blob_path(&hash)).unwrap();
+        let report = state.repair_once().await.unwrap();
+        assert_eq!(report.unrepaired, vec![hash]);
+        // The body was never checked. It must not become a repair source.
+        assert_eq!(fetcher.requests().len(), 1);
+    }
+
+    #[tokio::test]
     async fn mirror_and_repair_stream_through_the_configured_fetcher() {
         let directory = tempfile::tempdir().unwrap();
         let bytes = b"bytes carried by an explicit transport adapter";
@@ -2430,6 +2493,130 @@ mod tests {
             grant_id: grant_id.to_owned(),
             issuer: Some(pubkey_for(issuer)),
         }
+    }
+
+    fn list_request(requester: u64, target: u64, now: u64) -> Request<Body> {
+        Request::builder()
+            .uri(format!("/list/{}", pubkey_for(target)))
+            .header(
+                AUTHORIZATION,
+                operation_authorization_for(requester, None, now, "list"),
+            )
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn listing_is_owner_set_scoped_and_revocation_takes_effect() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = test_config();
+        config.allowed_pubkeys.push(pubkey_for(2));
+        let now = unix_time();
+        config
+            .friend_grants
+            .push(friend_grant(3, "grant-three", 1, now));
+        let state = AppState::new(open_store(&directory), config).unwrap();
+        let app = router(state.clone());
+        let bytes = b"second owner's bytes";
+        assert_eq!(
+            app.clone()
+                .oneshot(upload_request(2, bytes, now))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CREATED
+        );
+        let response = app.clone().oneshot(list_request(1, 2, now)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let descriptors: serde_json::Value =
+            serde_json::from_slice(&response.into_body().collect().await.unwrap().to_bytes())
+                .unwrap();
+        assert_eq!(descriptors[0]["sha256"], hex::encode(Sha256::digest(bytes)));
+        for (requester, target) in [(1, 3), (3, 1), (3, 2), (4, 2)] {
+            assert_eq!(
+                app.clone()
+                    .oneshot(list_request(requester, target, now))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::UNAUTHORIZED
+            );
+        }
+        let unsigned = Request::builder()
+            .uri(format!("/list/{}", pubkey_for(2)))
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(unsigned).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        state.set_owner_keys(vec![pubkey_for(1)]).await.unwrap();
+        assert_eq!(
+            app.clone()
+                .oneshot(list_request(1, 2, now))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            app.oneshot(list_request(2, 2, now)).await.unwrap().status(),
+            StatusCode::OK
+        );
+    }
+
+    #[tokio::test]
+    async fn a_friend_lists_only_the_current_grants_claims() {
+        let directory = tempfile::tempdir().unwrap();
+        let now = unix_time();
+        let mut config = test_config();
+        config
+            .friend_grants
+            .push(friend_grant(2, "old-grant", 1, now));
+        let state = AppState::new(open_store(&directory), config).unwrap();
+        let app = router(state.clone());
+        let old = b"old grant claim";
+        assert_eq!(
+            app.clone()
+                .oneshot(upload_request(2, old, now))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CREATED
+        );
+        state
+            .set_friend_grants(vec![friend_grant(2, "new-grant", 1, now)])
+            .await
+            .unwrap();
+        let new = b"new grant claim";
+        assert_eq!(
+            app.clone()
+                .oneshot(upload_request(2, new, now))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CREATED
+        );
+        let listed = listed_classes(&app, 2, now).await;
+        assert_eq!(listed.len(), 1);
+        assert!(listed.contains_key(&hex::encode(Sha256::digest(new))));
+        // A cursor outside this grant must not leak its catalogue position.
+        let request = Request::builder()
+            .uri(format!(
+                "/list/{}?cursor={}",
+                pubkey_for(2),
+                hex::encode(Sha256::digest(old))
+            ))
+            .header(
+                AUTHORIZATION,
+                operation_authorization_for(2, None, now, "list"),
+            )
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.oneshot(request).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
     }
 
     fn tier_of(store: &Store, hash: &str) -> RetentionTier {

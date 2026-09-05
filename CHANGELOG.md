@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.3.0 - 2026-09-05
+
+- Implement the agreed owner-set and current-friend-grant listing scopes.
+  Keep signature, operation, expiry and server validation, with self-only
+  listing for other signed requesters and no unsigned catalogue access.
+- Record successful integrity scans as `last_verified` and verified source
+  fetches as `verified_at`, refreshing the source after successful repair.
+- Fix the deduplicated mirror path recording unread bodies as verified
+  sources. Schema 4 preserves all blobs, claims and source URLs but leaves
+  old timestamps unknown; these historical sources need explicit verified
+  re-admission before automatic repair. No custody promise is inferred.
+- Add migration, restart, bad-source, owner revocation, grant replacement and
+  hidden-cursor regressions. The bad-source test failed on v0.2.2; all 73 tests
+  pass locally on macOS 14.6.1 with Rust 1.94.1.
+
+Shell policy tombstones and admission filters remain unimplemented contract
+targets. This release does not close physical or independent-review gates.
+
 ## 0.2.2 - 2026-08-30
 
 - Build reqwest with `rustls-no-provider` and install ring as the process

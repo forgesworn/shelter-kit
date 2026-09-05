@@ -103,6 +103,14 @@ pub struct ClaimMetadata {
     pub class: Option<String>,
 }
 
+/// Local evidence of a source's most recent exact-length, exact-hash fetch.
+/// A migrated source has no verification timestamp until verified again.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RepairSource {
+    pub source_url: String,
+    pub verified_at: Option<u64>,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct EvictionRecord {
     pub sha256: String,
@@ -657,6 +665,28 @@ impl Store {
         cursor: Option<&str>,
         limit: usize,
     ) -> Result<Vec<ClaimMetadata>, StoreError> {
+        self.list_claims_scoped(signer_pubkey, None, cursor, limit)
+    }
+
+    /// List only active friend claims belonging to the supplied current grant.
+    /// The caller is responsible for authenticating the signer and grant.
+    pub fn list_claims_for_grant(
+        &self,
+        signer_pubkey: &str,
+        grant_id: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<ClaimMetadata>, StoreError> {
+        self.list_claims_scoped(signer_pubkey, Some(grant_id), cursor, limit)
+    }
+
+    fn list_claims_scoped(
+        &self,
+        signer_pubkey: &str,
+        grant_id: Option<&str>,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<ClaimMetadata>, StoreError> {
         if !(1..=100).contains(&limit) {
             return Err(StoreError::InvalidListLimit);
         }
@@ -671,8 +701,9 @@ impl Store {
                     .query_row(
                         "SELECT created_at FROM claims
                          WHERE signer_pubkey = ?1 AND hash = ?2
-                           AND (claim_expires_at IS NULL OR claim_expires_at > ?3)",
-                        params![signer_pubkey, cursor, now],
+                           AND (claim_expires_at IS NULL OR claim_expires_at > ?3)
+                           AND (?4 IS NULL OR (grant_id = ?4 AND retention_tier = 'friend'))",
+                        params![signer_pubkey, cursor, now, grant_id],
                         |row| row.get::<_, i64>(0),
                     )
                     .optional()?
@@ -686,6 +717,7 @@ impl Store {
              WHERE c.signer_pubkey = ?1
                AND (c.claim_expires_at IS NULL OR c.claim_expires_at > ?2)
                AND (?3 IS NULL OR c.created_at < ?3 OR (c.created_at = ?3 AND c.hash > ?4))
+               AND (?6 IS NULL OR (c.grant_id = ?6 AND c.retention_tier = 'friend'))
              ORDER BY c.created_at DESC, c.hash ASC
              LIMIT ?5",
         )?;
@@ -695,7 +727,8 @@ impl Store {
                 now,
                 cursor_position,
                 cursor.unwrap_or(""),
-                i64::try_from(limit).map_err(|_| StoreError::IntegerRange)?
+                i64::try_from(limit).map_err(|_| StoreError::IntegerRange)?,
+                grant_id,
             ],
             |row| {
                 Ok((
@@ -826,6 +859,10 @@ impl Store {
             }
             if hex::encode(hasher.finalize()) == hash {
                 healthy = healthy.checked_add(1).ok_or(StoreError::IntegerRange)?;
+                connection.execute(
+                    "UPDATE blobs SET last_verified = ?2 WHERE hash = ?1",
+                    params![hash, unix_time()?],
+                )?;
             } else {
                 corrupted.push(hash);
             }
@@ -838,6 +875,26 @@ impl Store {
         })
     }
 
+    /// Last successful integrity scan, not a promise about current custody.
+    /// New and migrated blobs have no timestamp until a scan checks the bytes.
+    pub fn last_verified(&self, hash: &str) -> Result<Option<u64>, StoreError> {
+        validate_hash(hash)?;
+        let value: Option<i64> = self
+            .connection()?
+            .query_row(
+                "SELECT last_verified FROM blobs WHERE hash = ?1",
+                [hash],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or(StoreError::MissingBlob)?;
+        value
+            .map(|value| u64::try_from(value).map_err(|_| StoreError::IntegerRange))
+            .transpose()
+    }
+
+    /// Call only after consuming and verifying this source's exact bytes.
+    /// A local deduplication hit or successful response headers are insufficient.
     pub fn record_repair_source(&self, hash: &str, source_url: &str) -> Result<(), StoreError> {
         validate_hash(hash)?;
         let connection = self.connection()?;
@@ -845,10 +902,34 @@ impl Store {
             return Err(StoreError::MissingBlob);
         }
         connection.execute(
-            "INSERT OR IGNORE INTO repair_sources (hash, source_url, created_at) VALUES (?1, ?2, ?3)",
+            "INSERT INTO repair_sources (hash, source_url, created_at, verified_at)
+             VALUES (?1, ?2, ?3, ?3)
+             ON CONFLICT(hash, source_url) DO UPDATE SET verified_at = excluded.verified_at",
             params![hash, source_url, unix_time()?],
         )?;
         Ok(())
+    }
+
+    pub fn repair_sources(&self, hash: &str) -> Result<Vec<RepairSource>, StoreError> {
+        validate_hash(hash)?;
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT source_url, verified_at FROM repair_sources WHERE hash = ?1
+             ORDER BY verified_at DESC, source_url ASC",
+        )?;
+        let rows = statement.query_map([hash], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<i64>>(1)?))
+        })?;
+        rows.map(|row| {
+            let (source_url, verified_at) = row?;
+            Ok(RepairSource {
+                source_url,
+                verified_at: verified_at
+                    .map(|value| u64::try_from(value).map_err(|_| StoreError::IntegerRange))
+                    .transpose()?,
+            })
+        })
+        .collect()
     }
 
     pub fn repair_candidates(&self) -> Result<Vec<RepairCandidate>, StoreError> {
@@ -867,7 +948,8 @@ impl Store {
                     row.get(0)
                 })?;
             let mut statement = connection.prepare(
-                "SELECT source_url FROM repair_sources WHERE hash = ?1 ORDER BY created_at DESC",
+                "SELECT source_url FROM repair_sources WHERE hash = ?1 AND verified_at IS NOT NULL
+                 ORDER BY verified_at DESC, source_url ASC",
             )?;
             let sources = statement
                 .query_map([&hash], |row| row.get::<_, String>(0))?
@@ -1128,7 +1210,19 @@ impl Store {
         if !column_exists(&connection, "claims", "class")? {
             connection.execute("ALTER TABLE claims ADD COLUMN class TEXT", [])?;
         }
-        connection.execute_batch("PRAGMA user_version = 3;")?;
+        // No timestamp is inferred from insertion time: older mirror dedup hits
+        // could record a source without consuming its body. Preserve the URLs
+        // as unknown evidence; only a fresh verified fetch admits them to repair.
+        if !column_exists(&connection, "blobs", "last_verified")? {
+            connection.execute("ALTER TABLE blobs ADD COLUMN last_verified INTEGER", [])?;
+        }
+        if !column_exists(&connection, "repair_sources", "verified_at")? {
+            connection.execute(
+                "ALTER TABLE repair_sources ADD COLUMN verified_at INTEGER",
+                [],
+            )?;
+        }
+        connection.execute_batch("PRAGMA user_version = 4;")?;
         set_private_file_permissions(&self.database_path)?;
         Ok(())
     }
@@ -1766,13 +1860,14 @@ mod tests {
         assert_eq!(claims.len(), 1);
         assert_eq!(claims[0].sha256, hash);
         assert_eq!(claims[0].class, None);
-        assert_eq!(user_version(&root), 3);
+        assert_eq!(user_version(&root), 4);
+        assert_eq!(store.last_verified(&hash).unwrap(), None);
 
         // Idempotent: opening a migrated store again changes nothing.
         drop(store);
         let store = Store::open(config).unwrap();
         assert_eq!(store.list_claims(&signer, None, 10).unwrap()[0].class, None);
-        assert_eq!(user_version(&root), 3);
+        assert_eq!(user_version(&root), 4);
     }
 
     #[test]
@@ -1973,6 +2068,77 @@ mod tests {
         );
         assert!(!store.blob_path(&hash).exists());
         assert_eq!(store.stats().unwrap().blobs, 0);
+    }
+
+    #[test]
+    fn verification_timestamps_record_success_and_survive_reopen() {
+        let (directory, store) = test_store(1024, 1024);
+        let hash = store_claim(
+            &store,
+            b"verified evidence",
+            owner_claim("owner", "text/plain"),
+        );
+        assert_eq!(store.last_verified(&hash).unwrap(), None);
+        store.verify_integrity().unwrap();
+        assert!(store.last_verified(&hash).unwrap().unwrap() > 1);
+        let source = format!("https://origin.example/{hash}");
+        store.record_repair_source(&hash, &source).unwrap();
+        let connection = store.connection().unwrap();
+        connection
+            .execute("UPDATE repair_sources SET verified_at = 1", [])
+            .unwrap();
+        connection
+            .execute("UPDATE blobs SET last_verified = 1", [])
+            .unwrap();
+        store.record_repair_source(&hash, &source).unwrap();
+        let sources = store.repair_sources(&hash).unwrap();
+        assert_eq!(sources.len(), 1);
+        assert!(sources[0].verified_at.unwrap() > 1);
+        // A failed scan preserves the last success; it does not certify now.
+        fs::write(store.blob_path(&hash), b"corrupted evidence").unwrap();
+        assert_eq!(
+            store.verify_integrity().unwrap().corrupted,
+            vec![hash.clone()]
+        );
+        assert_eq!(store.last_verified(&hash).unwrap(), Some(1));
+        let config = store.config.clone();
+        drop(connection);
+        drop(store);
+        let store = Store::open(config).unwrap();
+        assert_eq!(store.last_verified(&hash).unwrap(), Some(1));
+        assert_eq!(store.repair_sources(&hash).unwrap(), sources);
+        drop(directory);
+    }
+
+    #[test]
+    fn a_version_three_database_preserves_unknown_source_evidence() {
+        let (_directory, store) = test_store(1024, 1024);
+        let hash = store_claim(&store, b"migration", owner_claim("owner", "text/plain"));
+        store
+            .record_repair_source(&hash, "https://origin.example/blob")
+            .unwrap();
+        let config = store.config.clone();
+        // Reconstruct schema v3, retaining a source that may have been a
+        // deduplication hit in the old implementation.
+        let connection = store.connection().unwrap();
+        connection
+            .execute_batch(
+                "ALTER TABLE blobs DROP COLUMN last_verified;
+            ALTER TABLE repair_sources DROP COLUMN verified_at;
+            PRAGMA user_version = 3;",
+            )
+            .unwrap();
+        drop(connection);
+        drop(store);
+        let store = Store::open(config).unwrap();
+        assert_eq!(
+            store.list_claims("owner", None, 10).unwrap()[0].sha256,
+            hash
+        );
+        assert_eq!(store.last_verified(&hash).unwrap(), None);
+        assert_eq!(store.repair_sources(&hash).unwrap()[0].verified_at, None);
+        fs::remove_file(store.blob_path(&hash)).unwrap();
+        assert!(store.repair_candidates().unwrap()[0].sources.is_empty());
     }
 
     #[test]
