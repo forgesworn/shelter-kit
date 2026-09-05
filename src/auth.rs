@@ -151,11 +151,21 @@ impl AuthPolicy {
         expected_pubkey: &str,
         now: u64,
     ) -> Result<VerifiedUpload, AuthError> {
-        let verified = self.verify_operation(authorization, None, "list", now)?;
+        let verified = self.verify_list_identity(authorization, now)?;
         if verified.owner_pubkey != expected_pubkey {
             return Err(AuthError::WrongPubkey);
         }
         Ok(verified)
+    }
+
+    // Scope is resolved by the router against the shell's current owner/grant
+    // set. The public verify_list API retains its self-only guarantee.
+    pub(crate) fn verify_list_identity(
+        &self,
+        authorization: Option<&str>,
+        now: u64,
+    ) -> Result<VerifiedUpload, AuthError> {
+        self.verify_operation(authorization, None, "list", now)
     }
 
     fn verify_operation(
