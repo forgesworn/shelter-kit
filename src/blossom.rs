@@ -111,6 +111,9 @@ struct InnerState {
     /// boundary.  A request clones the `Arc` once and reads nothing else, so
     /// an in-flight upload keeps the policy it started under.
     policy: RwLock<Arc<Policy>>,
+    /// Serialise read/modify/reconcile so one update cannot overwrite another
+    /// with an owner or grant set captured before that change completed.
+    policy_updates: tokio::sync::Mutex<()>,
     fetcher: Option<Arc<dyn BlobFetcher>>,
     write_slots: Arc<Semaphore>,
     write_slot_count: u32,
@@ -400,6 +403,7 @@ impl AppState {
                 accepted_server_names: config.accepted_server_names,
                 public_auth,
                 policy: RwLock::new(Arc::new(policy)),
+                policy_updates: tokio::sync::Mutex::new(()),
                 fetcher,
                 write_slots: Arc::new(Semaphore::new(config.max_concurrent_writes)),
                 write_slot_count,
@@ -409,10 +413,9 @@ impl AppState {
 
     /// The policy a request reads for its whole lifetime.
     ///
-    /// Taken once, at the start of a request and **before** any write permit
-    /// is acquired.  That ordering is what makes the reconcile boundary safe:
-    /// nothing ever waits on this lock while holding a permit, and the
-    /// boundary holds every permit while it waits for the lock.
+    /// Writers take their snapshot while holding a write permit. A reconcile
+    /// boundary must acquire every permit before changing this policy, and
+    /// never holds a policy lock while waiting for permits.
     async fn policy(&self) -> Arc<Policy> {
         self.inner.policy.read().await.clone()
     }
@@ -424,6 +427,7 @@ impl AppState {
     /// — so a refusal leaves the running node untouched.  It then takes effect
     /// at the next reconcile boundary, never mid-stream.
     pub async fn set_owner_keys(&self, keys: Vec<String>) -> Result<(), BlossomConfigError> {
+        let _update = self.inner.policy_updates.lock().await;
         let current = self.policy().await;
         let next = Policy::build(
             keys,
@@ -445,6 +449,7 @@ impl AppState {
         &self,
         grants: Vec<FriendGrant>,
     ) -> Result<(), BlossomConfigError> {
+        let _update = self.inner.policy_updates.lock().await;
         let current = self.policy().await;
         let next = Policy::build(
             current.owner_pubkeys.iter().cloned().collect(),
@@ -2120,6 +2125,42 @@ mod tests {
                 .count(),
             0
         );
+    }
+
+    #[tokio::test]
+    async fn simultaneous_policy_updates_cannot_restore_a_removed_owner() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = test_config();
+        config.allowed_pubkeys.push(pubkey_for(2));
+        let state = AppState::new(open_store(&directory), config).unwrap();
+        // Hold one permit so both changes wait at the reconcile boundary.
+        // Poll both futures once before releasing it: on the old code both
+        // captured the old owner set, and the friend update restored owner 2.
+        let held = state
+            .inner
+            .write_slots
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+        let owner_state = state.clone();
+        let friend_state = state.clone();
+        let remove_owner = owner_state.set_owner_keys(vec![pubkey_for(1)]);
+        let add_friend =
+            friend_state.set_friend_grants(vec![friend_grant(3, "new-grant", 1, unix_time())]);
+        tokio::pin!(remove_owner, add_friend);
+        assert!(futures_util::poll!(&mut remove_owner).is_pending());
+        assert!(futures_util::poll!(&mut add_friend).is_pending());
+        drop(held);
+        let (owner_result, friend_result) = tokio::join!(remove_owner, add_friend);
+        owner_result.unwrap();
+        friend_result.unwrap();
+        let policy = state.policy().await;
+        assert!(
+            !policy.owner_pubkeys.contains(&pubkey_for(2)),
+            "friend update must not restore a revoked owner"
+        );
+        assert!(policy.friend_grants.contains_key(&pubkey_for(3)));
     }
 
     #[tokio::test]

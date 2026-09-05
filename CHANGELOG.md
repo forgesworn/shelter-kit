@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.4.1 - 2026-09-05
+
+- Serialise concurrent owner-set and friend-grant updates across their
+  snapshot and reconcile boundary. A friend update that waited behind an
+  owner removal could otherwise restore the stale owner set. A deterministic
+  regression reproduced that behaviour in 0.4.0 and now retains both changes.
+- No schema, wire-format or public API change; schema 5 remains in use.
+
 ## 0.4.0 - 2026-09-05
 
 - Implement shell policy tombstones with atomic claim/source removal, restart
