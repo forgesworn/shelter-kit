@@ -86,6 +86,9 @@ These implement the agreed contract's listing and verification requirements.
   releases do not enforce tombstones: do not reopen schema-5 data with a core
   older than 0.4.0, including during a rollback.
 
+Version 0.4.1 also serialises owner/grant updates from snapshot through
+reconciliation, so a concurrent friend update cannot restore a removed owner.
+
 ## Not implemented here
 
 Shelter Kit does not open a port, run Tor, punch through NAT, provide STUN/TURN,
@@ -98,7 +101,7 @@ moved, not evidence that another machine will retain them.
 
 ```toml
 [dependencies]
-shelter-kit = { git = "https://github.com/forgesworn/shelter-kit", tag = "v0.4.0" }
+shelter-kit = { git = "https://github.com/forgesworn/shelter-kit", tag = "v0.4.1" }
 ```
 
 Create a `Store`, build an `AppState` from a `BlossomConfig`, optionally supply
