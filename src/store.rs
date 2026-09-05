@@ -1,3 +1,4 @@
+use crate::admission::{ADMISSION_PREFIX_BYTES, AdmissionCheck, AdmissionFilter};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -78,6 +79,15 @@ pub struct Store {
     /// handle rather than the one it was called on. `config.quota_bytes`
     /// stays the value the store was opened with; this is the live one.
     live_quota_bytes: Arc<AtomicU64>,
+    admission_filter: Option<Arc<dyn AdmissionFilter>>,
+}
+
+/// A trusted shell's local policy decision, not a remotely accepted message.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct Tombstone {
+    pub hash: String,
+    pub signer_pubkey: String,
+    pub created_at: u64,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -133,6 +143,7 @@ pub struct UploadReservation {
     expected_hash: String,
     expected_size: u64,
     claim: ClaimSpec,
+    allow_tombstone_restore: bool,
     temp_path: PathBuf,
     completed: bool,
 }
@@ -231,6 +242,14 @@ pub struct RepairCandidate {
 
 #[derive(Debug, Error)]
 pub enum StoreError {
+    #[error("the shell has tombstoned this hash")]
+    Tombstoned,
+    #[error("the configured admission filter rejected this write")]
+    AdmissionRejected,
+    #[error("invalid tombstone public key")]
+    InvalidTombstonePubkey,
+    #[error("unsupported storage schema version {0}")]
+    UnsupportedSchema(i64),
     #[error("invalid SHA-256 digest")]
     InvalidHash,
     #[error("blob size {size} exceeds the per-blob limit of {limit} bytes")]
@@ -271,6 +290,13 @@ pub enum StoreError {
 
 impl Store {
     pub fn open(config: StoreConfig) -> Result<Self, StoreError> {
+        Self::open_with_admission_filter(config, None)
+    }
+
+    pub fn open_with_admission_filter(
+        config: StoreConfig,
+        admission_filter: Option<Arc<dyn AdmissionFilter>>,
+    ) -> Result<Self, StoreError> {
         if config.quota_bytes > i64::MAX as u64 || config.max_blob_bytes > i64::MAX as u64 {
             return Err(StoreError::IntegerRange);
         }
@@ -304,6 +330,7 @@ impl Store {
             config,
             database_path,
             _lock: Arc::new(lock),
+            admission_filter,
         };
         store.initialise_database()?;
         store.clear_interrupted_uploads()?;
@@ -427,7 +454,27 @@ impl Store {
         &self,
         expected_hash: &str,
         expected_size: u64,
+        claim: ClaimSpec,
+    ) -> Result<UploadStart, StoreError> {
+        self.begin_claimed_write(expected_hash, expected_size, claim, true)
+    }
+
+    /// Mirrors cannot undo a shell takedown. An owner restores with an upload.
+    pub fn begin_claimed_mirror(
+        &self,
+        expected_hash: &str,
+        expected_size: u64,
+        claim: ClaimSpec,
+    ) -> Result<UploadStart, StoreError> {
+        self.begin_claimed_write(expected_hash, expected_size, claim, false)
+    }
+
+    fn begin_claimed_write(
+        &self,
+        expected_hash: &str,
+        expected_size: u64,
         mut claim: ClaimSpec,
+        allow_tombstone_restore: bool,
     ) -> Result<UploadStart, StoreError> {
         // The class is advisory, so it is normalised, never rejected: an
         // out-of-bounds label becomes the shell's default rather than a
@@ -449,10 +496,16 @@ impl Store {
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now = unix_time()?;
 
+        enforce_tombstone(
+            &transaction,
+            expected_hash,
+            allow_tombstone_restore && claim.retention_tier == RetentionTier::Owner,
+        )?;
         if let Some((_, stored_size, _)) = query_blob_row(&transaction, expected_hash)? {
             if stored_size != expected_size {
                 return Err(StoreError::LengthMismatch);
             }
+            self.inspect_path(&self.blob_path(expected_hash))?;
             enforce_friend_limit(&transaction, &claim, expected_hash, expected_size, now)?;
             upsert_claim(&transaction, expected_hash, &claim, now)?;
             let metadata =
@@ -532,8 +585,98 @@ impl Store {
             expected_hash: expected_hash.to_owned(),
             expected_size,
             claim,
+            allow_tombstone_restore,
             completed: false,
         })))
+    }
+
+    /// Persist a shell policy decision and remove every claim and local copy.
+    /// The caller must authenticate and authorise the shell action. This method
+    /// is never exposed as a public Blossom route and does not fetch remote policy.
+    /// Existing reservations, including owner writes, are invalidated so an old
+    /// in-flight upload cannot reverse the decision after this returns.
+    pub fn write_tombstone(&self, tombstone: &Tombstone) -> Result<(), StoreError> {
+        validate_hash(&tombstone.hash)?;
+        validate_hash(&tombstone.signer_pubkey).map_err(|_| StoreError::InvalidTombstonePubkey)?;
+        let created_at =
+            i64::try_from(tombstone.created_at).map_err(|_| StoreError::IntegerRange)?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let mut pending = PendingEvictions::default();
+        if let Some((_, size, _)) = query_blob_row(&transaction, &tombstone.hash)? {
+            let tier = query_blob(&transaction, &tombstone.hash)?
+                .map_or(RetentionTier::Guest, |metadata| metadata.retention_tier);
+            let original_path = self.blob_path(&tombstone.hash);
+            if original_path.exists() {
+                let tombstone_path = self.config.root.join("tmp").join(format!(
+                    "{}.{}.delete",
+                    tombstone.hash,
+                    Uuid::new_v4().simple()
+                ));
+                fs::rename(&original_path, &tombstone_path)?;
+                pending.items.push(PendingEviction {
+                    original_path,
+                    tombstone_path,
+                    record: EvictionRecord {
+                        sha256: tombstone.hash.clone(),
+                        size,
+                        retention_tier: tier,
+                        reason: "shell-tombstone",
+                        evicted_at: tombstone.created_at,
+                    },
+                });
+            }
+        }
+        transaction.execute(
+            "DELETE FROM reservations WHERE hash = ?1",
+            [&tombstone.hash],
+        )?;
+        transaction.execute("DELETE FROM blobs WHERE hash = ?1", [&tombstone.hash])?;
+        transaction.execute(
+            "INSERT INTO policy_tombstones (hash, signer_pubkey, created_at) VALUES (?1, ?2, ?3)
+             ON CONFLICT(hash) DO UPDATE SET signer_pubkey = excluded.signer_pubkey,
+                created_at = excluded.created_at",
+            params![tombstone.hash, tombstone.signer_pubkey, created_at],
+        )?;
+        transaction.commit()?;
+        pending.commit();
+        Ok(())
+    }
+
+    pub fn tombstone(&self, hash: &str) -> Result<Option<Tombstone>, StoreError> {
+        validate_hash(hash)?;
+        let connection = self.connection()?;
+        Ok(connection
+            .query_row(
+                "SELECT hash, signer_pubkey, created_at FROM policy_tombstones WHERE hash = ?1",
+                [hash],
+                |row| {
+                    Ok(Tombstone {
+                        hash: row.get(0)?,
+                        signer_pubkey: row.get(1)?,
+                        created_at: row
+                            .get::<_, i64>(2)?
+                            .try_into()
+                            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(2, -1))?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    pub(crate) fn admission_check(&self, size: u64) -> AdmissionCheck {
+        AdmissionCheck::new(self.admission_filter.clone(), size)
+    }
+
+    fn inspect_path(&self, path: &Path) -> Result<(), StoreError> {
+        if self.admission_filter.is_none() {
+            return Ok(());
+        }
+        let mut prefix = Vec::with_capacity(ADMISSION_PREFIX_BYTES);
+        File::open(path)?
+            .take(ADMISSION_PREFIX_BYTES as u64)
+            .read_to_end(&mut prefix)?;
+        self.admission_check(prefix.len() as u64).push(&prefix)
     }
 
     pub fn check_upload(&self, expected_hash: &str, expected_size: u64) -> Result<(), StoreError> {
@@ -570,6 +713,11 @@ impl Store {
             i64::try_from(expected_size).map_err(|_| StoreError::IntegerRange)?;
         let connection = self.connection()?;
         let now = unix_time()?;
+        enforce_tombstone(
+            &connection,
+            expected_hash,
+            claim.retention_tier == RetentionTier::Owner,
+        )?;
         if let Some((_, stored_size, _)) = query_blob_row(&connection, expected_hash)? {
             if stored_size != expected_size {
                 return Err(StoreError::LengthMismatch);
@@ -1138,8 +1286,17 @@ impl Store {
 
     fn initialise_database(&self) -> Result<(), StoreError> {
         let connection = self.connection()?;
+        let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if version > 5 {
+            return Err(StoreError::UnsupportedSchema(version));
+        }
         connection.execute_batch(
             "BEGIN IMMEDIATE;
+             CREATE TABLE IF NOT EXISTS policy_tombstones (
+                hash TEXT PRIMARY KEY NOT NULL,
+                signer_pubkey TEXT NOT NULL,
+                created_at INTEGER NOT NULL CHECK (created_at >= 0)
+             );
              CREATE TABLE IF NOT EXISTS blobs (
                 hash TEXT PRIMARY KEY NOT NULL,
                 size INTEGER NOT NULL CHECK (size >= 0),
@@ -1222,7 +1379,7 @@ impl Store {
                 [],
             )?;
         }
-        connection.execute_batch("PRAGMA user_version = 4;")?;
+        connection.execute_batch("PRAGMA user_version = 5;")?;
         set_private_file_permissions(&self.database_path)?;
         Ok(())
     }
@@ -1305,8 +1462,10 @@ impl RepairReservation {
         if actual_size != self.expected_size {
             return Err(StoreError::LengthMismatch);
         }
+        self.store.inspect_path(&self.temp_path)?;
         let mut connection = self.store.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        enforce_tombstone(&transaction, &self.expected_hash, false)?;
         let metadata =
             query_blob(&transaction, &self.expected_hash)?.ok_or(StoreError::MissingBlob)?;
         if metadata.size != self.expected_size {
@@ -1383,6 +1542,7 @@ impl UploadReservation {
         if actual_size != self.expected_size {
             return Err(StoreError::LengthMismatch);
         }
+        self.store.inspect_path(&self.temp_path)?;
 
         let mut connection = self.store.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1397,6 +1557,11 @@ impl UploadReservation {
         if !exists {
             return Err(StoreError::MissingReservation);
         }
+        enforce_tombstone(
+            &transaction,
+            &self.expected_hash,
+            self.allow_tombstone_restore && self.claim.retention_tier == RetentionTier::Owner,
+        )?;
 
         let uploaded = unix_time()?;
         if let Some((_, stored_size, _)) = query_blob_row(&transaction, &self.expected_hash)? {
@@ -1425,6 +1590,12 @@ impl UploadReservation {
         let metadata =
             query_blob(&transaction, &self.expected_hash)?.ok_or(StoreError::MissingBlob)?;
         transaction.execute("DELETE FROM reservations WHERE id = ?1", [&self.id])?;
+        if self.allow_tombstone_restore && self.claim.retention_tier == RetentionTier::Owner {
+            transaction.execute(
+                "DELETE FROM policy_tombstones WHERE hash = ?1",
+                [&self.expected_hash],
+            )?;
+        }
         transaction.commit()?;
         self.completed = true;
         Ok(metadata)
@@ -1444,6 +1615,26 @@ impl Drop for UploadReservation {
             self.cancel();
         }
     }
+}
+
+fn enforce_tombstone(
+    connection: &Connection,
+    hash: &str,
+    owner_restore: bool,
+) -> Result<(), StoreError> {
+    if !owner_restore
+        && connection
+            .query_row(
+                "SELECT 1 FROM policy_tombstones WHERE hash = ?1",
+                [hash],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some()
+    {
+        return Err(StoreError::Tombstoned);
+    }
+    Ok(())
 }
 
 fn validate_claim(claim: &ClaimSpec) -> Result<(), StoreError> {
@@ -1770,6 +1961,252 @@ mod tests {
         hash
     }
 
+    #[test]
+    fn tombstones_survive_restart_block_writes_and_require_a_fresh_owner_upload() {
+        let (_directory, store) = test_store(100_000, 20_000);
+        let bytes = b"shell takedown regression";
+        let hash = store_claim(&store, bytes, owner_claim("owner", "text/plain"));
+        store_claim(&store, bytes, guest_claim("guest"));
+        store
+            .record_repair_source(&hash, &format!("https://source.example/{hash}"))
+            .unwrap();
+        let repair = store.begin_repair(&hash).unwrap();
+        fs::write(repair.temp_path(), bytes).unwrap();
+        let tombstone = Tombstone {
+            hash: hash.clone(),
+            signer_pubkey: "01".repeat(32),
+            created_at: 100,
+        };
+        store.write_tombstone(&tombstone).unwrap();
+        assert!(store.get(&hash).unwrap().is_none());
+        assert!(!store.blob_path(&hash).exists());
+        assert!(store.list_claims("owner", None, 100).unwrap().is_empty());
+        assert!(store.repair_sources(&hash).unwrap().is_empty());
+        assert!(matches!(
+            repair.commit(&hash, bytes.len() as u64),
+            Err(StoreError::Tombstoned)
+        ));
+        let config = store.config();
+        drop(store);
+        let store = Store::open(config).unwrap();
+        assert_eq!(store.tombstone(&hash).unwrap(), Some(tombstone));
+        for claim in [
+            guest_claim("guest"),
+            friend_claim("friend", 10000, unix_time().unwrap() as u64 + 300),
+        ] {
+            assert!(matches!(
+                store.check_claimed_upload(&hash, bytes.len() as u64, &claim),
+                Err(StoreError::Tombstoned)
+            ));
+            assert!(matches!(
+                store.begin_claimed_upload(&hash, bytes.len() as u64, claim),
+                Err(StoreError::Tombstoned)
+            ));
+        }
+        assert!(matches!(
+            store.begin_claimed_mirror(
+                &hash,
+                bytes.len() as u64,
+                owner_claim("owner", "text/plain")
+            ),
+            Err(StoreError::Tombstoned)
+        ));
+        let UploadStart::Reserved(failed) = store
+            .begin_claimed_upload(
+                &hash,
+                bytes.len() as u64,
+                owner_claim("owner", "text/plain"),
+            )
+            .unwrap()
+        else {
+            panic!("expected reservation");
+        };
+        fs::write(failed.temp_path(), bytes).unwrap();
+        assert!(matches!(
+            failed.commit(&"00".repeat(32), bytes.len() as u64),
+            Err(StoreError::HashMismatch)
+        ));
+        assert!(store.tombstone(&hash).unwrap().is_some());
+        store_claim(&store, bytes, owner_claim("owner", "text/plain"));
+        assert!(store.tombstone(&hash).unwrap().is_none());
+        assert_eq!(fs::read(store.blob_path(&hash)).unwrap(), bytes);
+        assert_eq!(store.stats().unwrap().reserved_bytes, 0);
+    }
+
+    #[test]
+    fn tombstones_cancel_in_flight_owner_and_guest_reservations() {
+        let (_directory, store) = test_store(100_000, 20_000);
+        let bytes = b"old upload must not undo a later shell decision";
+        let hash = hex::encode(Sha256::digest(bytes));
+        for claim in [owner_claim("owner", "text/plain"), guest_claim("guest")] {
+            // Each iteration starts from a restored, then normally deleted hash.
+            if store.tombstone(&hash).unwrap().is_some() {
+                store_claim(&store, bytes, owner_claim("owner", "text/plain"));
+                store.delete_claim(&hash, "owner").unwrap();
+            }
+            let UploadStart::Reserved(pending) = store
+                .begin_claimed_upload(&hash, bytes.len() as u64, claim)
+                .unwrap()
+            else {
+                panic!("expected reservation");
+            };
+            fs::write(pending.temp_path(), bytes).unwrap();
+            let path = pending.temp_path().to_owned();
+            store
+                .write_tombstone(&Tombstone {
+                    hash: hash.clone(),
+                    signer_pubkey: "01".repeat(32),
+                    created_at: 100,
+                })
+                .unwrap();
+            assert!(matches!(
+                pending.commit(&hash, bytes.len() as u64),
+                Err(StoreError::MissingReservation)
+            ));
+            assert!(!path.exists());
+            assert!(store.tombstone(&hash).unwrap().is_some());
+            assert!(store.get(&hash).unwrap().is_none());
+            assert_eq!(store.stats().unwrap().reserved_bytes, 0);
+        }
+    }
+
+    #[test]
+    fn rejected_admission_preserves_tombstones_and_releases_reservations() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open_with_admission_filter(
+            StoreConfig {
+                root: directory.path().join("data"),
+                quota_bytes: 100_000,
+                max_blob_bytes: 20_000,
+            },
+            Some(Arc::new(crate::SealedParcelsOnly)),
+        )
+        .unwrap();
+        let bytes = [0; 8192];
+        let hash = hex::encode(Sha256::digest(bytes));
+        store
+            .write_tombstone(&Tombstone {
+                hash: hash.clone(),
+                signer_pubkey: "01".repeat(32),
+                created_at: 100,
+            })
+            .unwrap();
+        let UploadStart::Reserved(pending) = store
+            .begin_claimed_upload(
+                &hash,
+                bytes.len() as u64,
+                owner_claim("owner", "text/plain"),
+            )
+            .unwrap()
+        else {
+            panic!("expected reservation");
+        };
+        let path = pending.temp_path().to_owned();
+        fs::write(&path, bytes).unwrap();
+        assert!(matches!(
+            pending.commit(&hash, bytes.len() as u64),
+            Err(StoreError::AdmissionRejected)
+        ));
+        assert!(!path.exists());
+        assert!(store.tombstone(&hash).unwrap().is_some());
+        assert_eq!(store.stats().unwrap().reserved_bytes, 0);
+        let high_entropy: Vec<u8> = (0..8192).map(|i| (i % 256) as u8).collect();
+        store_claim(
+            &store,
+            &high_entropy,
+            owner_claim("owner", "application/octet-stream"),
+        );
+    }
+
+    #[test]
+    fn failed_tombstone_transaction_restores_bytes_and_claims() {
+        let (_directory, store) = test_store(100_000, 20_000);
+        let bytes = b"rollback must keep the owner's copy";
+        let hash = store_claim(&store, bytes, owner_claim("owner", "text/plain"));
+        store.connection().unwrap().execute_batch(
+            "CREATE TRIGGER fail_delete BEFORE DELETE ON blobs BEGIN SELECT RAISE(ABORT, 'synthetic failure'); END;"
+        ).unwrap();
+        assert!(matches!(
+            store.write_tombstone(&Tombstone {
+                hash: hash.clone(),
+                signer_pubkey: "01".repeat(32),
+                created_at: 100,
+            }),
+            Err(StoreError::Database(_))
+        ));
+        assert_eq!(fs::read(store.blob_path(&hash)).unwrap(), bytes);
+        assert_eq!(store.list_claims("owner", None, 100).unwrap().len(), 1);
+        assert!(store.tombstone(&hash).unwrap().is_none());
+    }
+
+    #[test]
+    fn enabling_a_filter_refuses_new_plaintext_claims_without_evicting_existing_copies() {
+        let (_directory, store) = test_store(100_000, 20_000);
+        let bytes = b"existing plaintext";
+        let hash = store_claim(&store, bytes, owner_claim("owner", "text/plain"));
+        let config = store.config();
+        drop(store);
+        let store =
+            Store::open_with_admission_filter(config, Some(Arc::new(crate::SealedParcelsOnly)))
+                .unwrap();
+        assert!(matches!(
+            store.begin_claimed_upload(
+                &hash,
+                bytes.len() as u64,
+                owner_claim("new-owner", "text/plain")
+            ),
+            Err(StoreError::AdmissionRejected)
+        ));
+        assert_eq!(store.list_claims("owner", None, 100).unwrap().len(), 1);
+        assert!(
+            store
+                .list_claims("new-owner", None, 100)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(fs::read(store.blob_path(&hash)).unwrap(), bytes);
+    }
+
+    #[test]
+    fn a_version_four_store_migrates_and_a_future_schema_is_refused_without_cleanup() {
+        let (_directory, store) = test_store(100_000, 20_000);
+        let bytes = b"migration must preserve bytes claims and source evidence";
+        let hash = store_claim(&store, bytes, owner_claim("owner", "text/plain"));
+        store
+            .record_repair_source(&hash, &format!("https://source.example/{hash}"))
+            .unwrap();
+        store.verify_integrity().unwrap();
+        let verified = store.last_verified(&hash).unwrap();
+        let source = store.repair_sources(&hash).unwrap();
+        let config = store.config();
+        store
+            .connection()
+            .unwrap()
+            .execute_batch("DROP TABLE policy_tombstones; PRAGMA user_version = 4;")
+            .unwrap();
+        drop(store);
+        let store = Store::open(config.clone()).unwrap();
+        assert_eq!(user_version(&config.root), 5);
+        assert_eq!(store.last_verified(&hash).unwrap(), verified);
+        assert_eq!(store.repair_sources(&hash).unwrap(), source);
+        assert_eq!(store.list_claims("owner", None, 100).unwrap().len(), 1);
+        assert_eq!(fs::read(store.blob_path(&hash)).unwrap(), bytes);
+        let interrupted = config.root.join("tmp/future.part");
+        fs::write(&interrupted, b"future upload").unwrap();
+        store
+            .connection()
+            .unwrap()
+            .execute_batch("PRAGMA user_version = 6;")
+            .unwrap();
+        drop(store);
+        assert!(matches!(
+            Store::open(config.clone()),
+            Err(StoreError::UnsupportedSchema(6))
+        ));
+        assert_eq!(user_version(&config.root), 6);
+        assert!(interrupted.exists());
+    }
+
     /// The 0.2 schema, exactly as `shelter-kit` 0.1.2 wrote it: no `class`
     /// column anywhere and `user_version = 2`.
     const VERSION_TWO_SCHEMA: &str = "
@@ -1860,14 +2297,14 @@ mod tests {
         assert_eq!(claims.len(), 1);
         assert_eq!(claims[0].sha256, hash);
         assert_eq!(claims[0].class, None);
-        assert_eq!(user_version(&root), 4);
+        assert_eq!(user_version(&root), 5);
         assert_eq!(store.last_verified(&hash).unwrap(), None);
 
         // Idempotent: opening a migrated store again changes nothing.
         drop(store);
         let store = Store::open(config).unwrap();
         assert_eq!(store.list_claims(&signer, None, 10).unwrap()[0].class, None);
-        assert_eq!(user_version(&root), 4);
+        assert_eq!(user_version(&root), 5);
     }
 
     #[test]

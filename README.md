@@ -59,7 +59,32 @@ joint 0.2 contract this implements is in
   certify a source; shells using `record_repair_source` must check its bytes.
 
 These implement the agreed contract's listing and verification requirements.
-Shell policy tombstones and optional admission filters remain outstanding.
+
+## Added in 0.4.0
+
+- Shell policy tombstones: `AppState::write_tombstone` waits for active writes,
+  records `{ hash, signer_pubkey, created_at }` and removes every claim, source
+  and local copy. The lower-level `Store::write_tombstone` also invalidates
+  existing upload reservations. The shell authorises this action; there is no
+  public tombstone route or automatic remote policy import.
+- Tombstoned hashes are refused at mirror before fetching and at non-owner
+  upload/preflight. A fresh, valid owner **upload** restores the hash and clears
+  the tombstone atomically. Failed uploads leave it blocked. Mirroring cannot
+  reverse a takedown, including when requested by an owner.
+- `Store::open_with_admission_filter(config, filter)` accepts an optional
+  `Arc<dyn AdmissionFilter>`; `Store::open` continues with no filter. Streaming
+  uploads, mirrors and repairs check the first 4 KiB after reservation and stop
+  at rejection. Direct store commits recheck that prefix. Filters must be
+  deterministic and perform no I/O. Rejection releases the reservation.
+- The supplied `SealedParcelsOnly` rejects common media magic at offset zero
+  and byte entropy below 6 bits per byte, including empty/very short bodies.
+  It is an operator posture: compressed plaintext can pass and encrypted data
+  can fail. It proves neither encryption nor content safety. Enabling it does
+  not evict existing copies, but new claims and repair writes must pass it.
+- Schema 5 adds tombstones without rewriting blobs, claims or verification
+  evidence. Newer unknown schemas are refused before startup cleanup. Older
+  releases do not enforce tombstones: do not reopen schema-5 data with a core
+  older than 0.4.0, including during a rollback.
 
 ## Not implemented here
 
@@ -73,7 +98,7 @@ moved, not evidence that another machine will retain them.
 
 ```toml
 [dependencies]
-shelter-kit = { git = "https://github.com/forgesworn/shelter-kit", tag = "v0.3.0" }
+shelter-kit = { git = "https://github.com/forgesworn/shelter-kit", tag = "v0.4.0" }
 ```
 
 Create a `Store`, build an `AppState` from a `BlossomConfig`, optionally supply

@@ -462,6 +462,26 @@ impl AppState {
         self.apply_at_reconcile_boundary(None, None).await
     }
 
+    /// Apply a trusted shell decision after all in-flight writes finish.
+    /// No public route accepts tombstones or imports another node's policy.
+    pub async fn write_tombstone(
+        &self,
+        tombstone: crate::Tombstone,
+    ) -> Result<(), BlossomConfigError> {
+        let _permits = self
+            .inner
+            .write_slots
+            .clone()
+            .acquire_many_owned(self.inner.write_slot_count)
+            .await
+            .map_err(|_| BlossomConfigError::Task)?;
+        let store = self.inner.store.clone();
+        spawn_blocking(move || store.write_tombstone(&tombstone))
+            .await
+            .map_err(|_| BlossomConfigError::Task)??;
+        Ok(())
+    }
+
     /// Re-supplies the storage quota; contract 0.2 §3 B13.
     ///
     /// Applied at the same reconcile boundary as [`AppState::set_owner_keys`]
@@ -643,6 +663,10 @@ async fn try_repair_candidate(
     let stream = &mut body;
     let mut hasher = Sha256::new();
     let mut received = 0_u64;
+    let mut admission = state.inner.store.admission_check(repair.expected_size());
+    if admission.push(&[]).is_err() {
+        return Ok(false);
+    }
     while let Some(chunk) = stream.next().await {
         let Ok(chunk) = chunk else {
             return Ok(false);
@@ -656,6 +680,9 @@ async fn try_repair_candidate(
         };
         received = total;
         if received > repair.expected_size() {
+            return Ok(false);
+        }
+        if admission.push(&chunk).is_err() {
             return Ok(false);
         }
         hasher.update(&chunk);
@@ -769,7 +796,13 @@ async fn upload(
     headers: HeaderMap,
     body: Body,
 ) -> Result<Response, ApiError> {
-    // One snapshot for the whole request, taken before the write permit.
+    let _write_permit = state
+        .inner
+        .write_slots
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| ApiError::too_many_requests())?;
+    // Take the snapshot while holding a permit, so reconciliation cannot overtake it.
     let policy = state.policy().await;
     let expected_hash = header_str(&headers, &X_SHA_256, "missing X-SHA-256 header")?;
     if !is_canonical_hash(expected_hash) {
@@ -801,12 +834,6 @@ async fn upload(
     // The store normalises the class the same way the event parser does, so
     // the descriptor reports exactly what was recorded.
     let claim_class = claim.class.clone();
-    let _write_permit = state
-        .inner
-        .write_slots
-        .clone()
-        .try_acquire_owned()
-        .map_err(|_| ApiError::too_many_requests())?;
 
     let store = state.inner.store.clone();
     let begin_hash = expected_hash.clone();
@@ -835,6 +862,11 @@ async fn upload(
             let mut stream = body.into_data_stream();
             let mut hasher = Sha256::new();
             let mut received = 0_u64;
+            let mut admission = state
+                .inner
+                .store
+                .admission_check(reservation.expected_size());
+            admission.push(&[]).map_err(ApiError::from_store)?;
 
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk.map_err(|_| ApiError::bad_request("upload stream failed"))?;
@@ -846,6 +878,7 @@ async fn upload(
                 if received > reservation.expected_size() {
                     return Err(ApiError::bad_request("body exceeds Content-Length"));
                 }
+                admission.push(&chunk).map_err(ApiError::from_store)?;
                 hasher.update(&chunk);
                 file.write_all(&chunk)
                     .await
@@ -919,6 +952,13 @@ async fn mirror(
     headers: HeaderMap,
     payload: Result<Json<MirrorRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
+    let _write_permit = state
+        .inner
+        .write_slots
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| ApiError::too_many_requests())?;
+    // Take the snapshot while holding a permit, so reconciliation cannot overtake it.
     let policy = state.policy().await;
     let fetcher = state
         .inner
@@ -968,12 +1008,17 @@ async fn mirror(
             }
             Err(error) => return Err(ApiError::from_auth(error)),
         };
-    let _write_permit = state
-        .inner
-        .write_slots
-        .clone()
-        .try_acquire_owned()
-        .map_err(|_| ApiError::too_many_requests())?;
+
+    let check_store = state.inner.store.clone();
+    let check_hash = expected_hash.clone();
+    if spawn_blocking(move || check_store.tombstone(&check_hash))
+        .await
+        .map_err(|_| ApiError::internal())?
+        .map_err(ApiError::from_store)?
+        .is_some()
+    {
+        return Err(ApiError::from_store(StoreError::Tombstoned));
+    }
 
     let fetched = fetcher
         .fetch(FetchRequest {
@@ -1001,7 +1046,7 @@ async fn mirror(
     let begin_hash = expected_hash.clone();
     let _verified = verified;
     let started =
-        spawn_blocking(move || store.begin_claimed_upload(&begin_hash, expected_size, claim))
+        spawn_blocking(move || store.begin_claimed_mirror(&begin_hash, expected_size, claim))
             .await
             .map_err(|_| ApiError::internal())?
             .map_err(ApiError::from_store)?;
@@ -1025,6 +1070,11 @@ async fn mirror(
             let stream = &mut body;
             let mut hasher = Sha256::new();
             let mut received = 0_u64;
+            let mut admission = state
+                .inner
+                .store
+                .admission_check(reservation.expected_size());
+            admission.push(&[]).map_err(ApiError::from_store)?;
 
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk
@@ -1039,6 +1089,7 @@ async fn mirror(
                         "mirror origin exceeded Content-Length",
                     ));
                 }
+                admission.push(&chunk).map_err(ApiError::from_store)?;
                 hasher.update(&chunk);
                 file.write_all(&chunk)
                     .await
@@ -1548,6 +1599,10 @@ impl ApiError {
 
     fn from_store(error: StoreError) -> Self {
         match error {
+            StoreError::Tombstoned => Self::forbidden("the shell has tombstoned this hash"),
+            StoreError::AdmissionRejected => {
+                Self::forbidden("the admission filter rejected this write")
+            }
             StoreError::BlobTooLarge { .. } => Self::payload_too_large(),
             StoreError::QuotaExceeded => Self {
                 status: StatusCode::INSUFFICIENT_STORAGE,
@@ -1928,6 +1983,143 @@ mod tests {
             max_concurrent_writes: 4,
             mirror_proxy: None,
         }
+    }
+
+    #[tokio::test]
+    async fn shell_tombstone_blocks_mirrors_before_fetch_and_only_owner_upload_restores() {
+        let directory = tempfile::tempdir().unwrap();
+        let bytes = b"shell policy crosses router boundaries";
+        let hash = hex::encode(Sha256::digest(bytes));
+        let fetcher = FakeFetcher::serving(bytes);
+        let mut config = test_config();
+        let now = unix_time();
+        config
+            .friend_grants
+            .push(friend_grant(2, "test-grant", 1, now));
+        config.open_shelter = true;
+        let state =
+            AppState::with_fetcher(open_store(&directory), config, fetcher.clone()).unwrap();
+        let app = router(state.clone());
+        assert_eq!(
+            app.clone()
+                .oneshot(upload_request(1, bytes, now))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CREATED
+        );
+        state
+            .write_tombstone(crate::Tombstone {
+                hash: hash.clone(),
+                signer_pubkey: pubkey_for(1),
+                created_at: now,
+            })
+            .await
+            .unwrap();
+        assert_eq!(download(&app, &hash).await.0, StatusCode::NOT_FOUND);
+        for signer in [1, 2, 3] {
+            assert_eq!(
+                app.clone()
+                    .oneshot(mirror_request_for(&hash, now, signer))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::FORBIDDEN
+            );
+        }
+        assert!(fetcher.requests().is_empty());
+        assert_eq!(
+            app.clone()
+                .oneshot(upload_request(2, bytes, now))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert!(state.store().tombstone(&hash).unwrap().is_some());
+        assert_eq!(
+            app.clone()
+                .oneshot(upload_request(1, bytes, now))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CREATED
+        );
+        assert!(state.store().tombstone(&hash).unwrap().is_none());
+        assert_eq!(download(&app, &hash).await.1, bytes.as_slice());
+    }
+
+    #[derive(Debug)]
+    struct ReservedPrefixProbe {
+        database: std::path::PathBuf,
+        seen: Mutex<Vec<usize>>,
+    }
+
+    impl crate::AdmissionFilter for ReservedPrefixProbe {
+        fn inspect(&self, prefix: &[u8]) -> crate::AdmissionDecision {
+            let connection = rusqlite::Connection::open(&self.database).unwrap();
+            let reserved: i64 = connection
+                .query_row("SELECT SUM(size) FROM reservations", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(reserved, 8192, "filter must run after reservation");
+            assert_eq!(prefix.len(), 4096);
+            self.seen.lock().unwrap().push(prefix.len());
+            crate::AdmissionDecision::Reject
+        }
+    }
+
+    #[tokio::test]
+    async fn admission_refuses_upload_and_mirror_at_four_kib_and_releases_the_reservation() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().join("data");
+        let filter = Arc::new(ReservedPrefixProbe {
+            database: root.join("wildbloom.sqlite3"),
+            seen: Mutex::new(Vec::new()),
+        });
+        let store = Store::open_with_admission_filter(
+            crate::StoreConfig {
+                root,
+                quota_bytes: 100_000,
+                max_blob_bytes: 20_000,
+            },
+            Some(filter.clone()),
+        )
+        .unwrap();
+        let bytes = [0; 8192];
+        let hash = hex::encode(Sha256::digest(bytes));
+        let state =
+            AppState::with_fetcher(store.clone(), test_config(), FakeFetcher::serving(&bytes))
+                .unwrap();
+        let app = router(state);
+        let mut request = upload_request(1, &bytes, unix_time());
+        let chunks = futures_util::stream::iter([0, 1]).map(|index| {
+            assert_eq!(index, 0, "rejected upload must not consume the next chunk");
+            Ok::<_, std::io::Error>(Bytes::from(vec![0; 4096]))
+        });
+        *request.body_mut() = Body::from_stream(chunks);
+        assert_eq!(
+            app.clone().oneshot(request).await.unwrap().status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(store.stats().unwrap().reserved_bytes, 0);
+        assert!(store.get(&hash).unwrap().is_none());
+        assert_eq!(
+            app.clone()
+                .oneshot(mirror_request(&hash, unix_time()))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(store.stats().unwrap().reserved_bytes, 0);
+        assert!(store.repair_sources(&hash).unwrap().is_empty());
+        assert_eq!(*filter.seen.lock().unwrap(), vec![4096, 4096]);
+        assert_eq!(
+            std::fs::read_dir(store.config().root.join("tmp"))
+                .unwrap()
+                .count(),
+            0
+        );
     }
 
     #[tokio::test]
