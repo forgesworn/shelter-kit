@@ -1,10 +1,12 @@
 //! Transport-neutral Blossom storage, retention and repair primitives.
 
+pub mod admission;
 pub mod auth;
 pub mod blossom;
 pub mod fetch;
 pub mod store;
 
+pub use admission::{AdmissionDecision, AdmissionFilter, SealedParcelsOnly};
 pub use blossom::{
     AppState, BlossomConfig, BlossomConfigError, FriendGrant, RepairError, RepairReport,
     ServerMetadata, router,
@@ -16,5 +18,5 @@ pub use fetch::{
 pub use store::{
     BlobMetadata, ClaimMetadata, ClaimSpec, DeleteOutcome, EvictionRecord, IntegrityReport,
     RepairCandidate, RepairReservation, RepairSource, RetentionTier, Store, StoreConfig,
-    StoreError,
+    StoreError, Tombstone,
 };

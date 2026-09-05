@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.4.0 - 2026-09-05
+
+- Implement shell policy tombstones with atomic claim/source removal, restart
+  persistence and refusal of blocked hashes. Only a fresh, verified owner
+  upload clears the policy; old reservations and repairs cannot undo it.
+- Add optional admission filters, disabled by default. Upload, mirror and
+  repair streams stop at a rejected first 4 KiB, after reservation. Store
+  commits enforce the same policy. Document the supplied entropy/media
+  heuristic's false positives and false negatives.
+- Migrate schema 4 to 5 while retaining existing verification evidence, and
+  refuse unknown future schemas before cleanup. Downgrading to a core that
+  predates tombstones is unsupported.
+- Acquire the write permit before taking the runtime owner/grant snapshot,
+  so a policy reconciliation cannot be overtaken by a stale write decision.
+- Add migration, rollback, in-flight cancellation, owner restoration,
+  deduplication and streaming refusal tests. Independent review and physical
+  product acceptance remain separate gates.
+
 ## 0.3.0 - 2026-09-05
 
 - Implement the agreed owner-set and current-friend-grant listing scopes.
