@@ -1027,7 +1027,7 @@ async fn mirror(
     }
     let source =
         Url::parse(&payload.url).map_err(|_| ApiError::bad_request("invalid mirror URL"))?;
-    let expected_hash = mirror_hash_from_url(&source)
+    let expected_hash = mirror_source_hash(&source)
         .ok_or_else(|| ApiError::forbidden("mirror source is not permitted"))?
         .to_owned();
     let source_url = source.to_string();
@@ -1353,6 +1353,27 @@ fn lane_hash_from_url(url: &Url) -> Option<&str> {
             .bytes()
             .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')))
     .then_some(hash)
+}
+
+/// T6 permits an explicitly configured native adapter for `fsl` mirrors as
+/// well as repairs. Keep HTTP's existing network policy intact. The adapter
+/// validates the native node identity, card, destination and network consent;
+/// the router still verifies authorisation and every returned byte.
+fn mirror_source_hash(url: &Url) -> Option<&str> {
+    if url.scheme() != "fsl" {
+        return mirror_hash_from_url(url);
+    }
+    if url.host_str().is_none()
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.port().is_some()
+        || url.query().is_some()
+        || url.fragment().is_some()
+        || url.path().strip_prefix('/')?.contains('/')
+    {
+        return None;
+    }
+    lane_hash_from_url(url)
 }
 
 fn mirror_hash_from_url(url: &Url) -> Option<&str> {
@@ -2391,6 +2412,175 @@ mod tests {
                 r#"{{"url":"https://origin.example/{hash}"}}"#
             )))
             .unwrap()
+    }
+
+    fn native_mirror_request(hash: &str, now: u64, secret: u64) -> Request<Body> {
+        let mut request = mirror_request_for(hash, now, secret);
+        let node = "ugq2dinbugq2dinbugq2dinbugq2dinbugq2dinbugq2dinbugqq";
+        *request.body_mut() = Body::from(
+            serde_json::json!({ "url": format!("fsl://{node}/{hash}.bin") }).to_string(),
+        );
+        request
+    }
+
+    #[tokio::test]
+    async fn a_native_mirror_reaches_its_adapter_and_records_only_verified_repair_evidence() {
+        let directory = tempfile::tempdir().unwrap();
+        let bytes = b"native mirror contract T6";
+        let hash = hex::encode(Sha256::digest(bytes));
+        let fetcher = FakeFetcher::serving(bytes);
+        let state =
+            AppState::with_fetcher(open_store(&directory), test_config(), fetcher.clone()).unwrap();
+        let app = router(state.clone());
+        assert_eq!(
+            app.clone()
+                .oneshot(native_mirror_request(&hash, unix_time(), 1))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CREATED
+        );
+        assert_eq!(download(&app, &hash).await.1, bytes.as_slice());
+        let sources = state.store().repair_sources(&hash).unwrap();
+        assert_eq!(sources.len(), 1);
+        assert!(sources[0].source_url.starts_with("fsl://"));
+        std::fs::remove_file(state.store().blob_path(&hash)).unwrap();
+        assert_eq!(state.repair_once().await.unwrap().repaired, 1);
+        assert_eq!(download(&app, &hash).await.1, bytes.as_slice());
+        assert_eq!(fetcher.requests().len(), 2);
+        assert_eq!(
+            fetcher.requests()[1].expected_size,
+            Some(bytes.len() as u64)
+        );
+    }
+
+    #[tokio::test]
+    async fn native_mirror_admission_rejects_bad_scope_and_bad_urls_before_fetching() {
+        let directory = tempfile::tempdir().unwrap();
+        let bytes = b"authorised native bytes";
+        let hash = hex::encode(Sha256::digest(bytes));
+        let fetcher = FakeFetcher::serving(bytes);
+        let state =
+            AppState::with_fetcher(open_store(&directory), test_config(), fetcher.clone()).unwrap();
+        let app = router(state.clone());
+        assert_eq!(
+            app.clone()
+                .oneshot(native_mirror_request(&hash, unix_time(), 2))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let mut wrong_hash = native_mirror_request(&hash, unix_time(), 1);
+        wrong_hash.headers_mut().insert(
+            AUTHORIZATION,
+            operation_authorization_for(1, Some(&"a".repeat(64)), unix_time(), "upload")
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(
+            app.clone().oneshot(wrong_hash).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let mut absent = native_mirror_request(&hash, unix_time(), 1);
+        absent.headers_mut().remove(AUTHORIZATION);
+        assert_eq!(
+            app.clone().oneshot(absent).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let node = "ugq2dinbugq2dinbugq2dinbugq2dinbugq2dinbugq2dinbugqq";
+        for url in [
+            format!("fsl://user@{node}/{hash}"),
+            format!("fsl://{node}:123/{hash}"),
+            format!("fsl://{node}/{hash}?token=value"),
+            format!("fsl://{node}/{hash}#fragment"),
+            format!("fsl://{node}/extra/{hash}"),
+            format!("fsl://{node}/not-a-hash"),
+            format!("file:///{hash}"),
+            format!("unknown://{node}/{hash}"),
+            format!("https://127.0.0.1/{hash}"),
+            format!("http://origin.example/{hash}"),
+        ] {
+            let mut request = native_mirror_request(&hash, unix_time(), 1);
+            *request.body_mut() = Body::from(serde_json::json!({ "url": url }).to_string());
+            assert_eq!(
+                app.clone().oneshot(request).await.unwrap().status(),
+                StatusCode::FORBIDDEN
+            );
+        }
+        assert!(fetcher.requests().is_empty());
+        assert_eq!(state.store().stats().unwrap().blobs, 0);
+        assert!(state.store().repair_sources(&hash).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn native_mirrors_keep_quota_length_and_digest_failures_atomic() {
+        let bytes = b"complete native blob";
+        let hash = hex::encode(Sha256::digest(bytes));
+        let mut corrupt = bytes.to_vec();
+        corrupt[0] ^= 1;
+        for (returned, declared) in [
+            (bytes.to_vec(), 2048),
+            (bytes[..5].to_vec(), bytes.len() as u64),
+            (corrupt, bytes.len() as u64),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let fetcher = FakeFetcher::with(FakeOutcome::Serve {
+                bytes: returned,
+                declared_size: declared,
+                content_type: None,
+            });
+            let state =
+                AppState::with_fetcher(open_store(&directory), test_config(), fetcher.clone())
+                    .unwrap();
+            let response = router(state.clone())
+                .oneshot(native_mirror_request(&hash, unix_time(), 1))
+                .await
+                .unwrap();
+            assert!(!response.status().is_success());
+            assert_eq!(
+                fetcher.requests().len(),
+                1,
+                "source reached only after authorisation"
+            );
+            assert_eq!(state.store().stats().unwrap().blobs, 0);
+            assert_eq!(state.store().stats().unwrap().reserved_bytes, 0);
+            assert!(state.store().repair_sources(&hash).unwrap().is_empty());
+            assert_eq!(
+                std::fs::read_dir(state.store().config().root.join("tmp"))
+                    .unwrap()
+                    .count(),
+                0
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_tor_only_node_does_not_fall_back_when_a_native_source_is_supplied() {
+        let directory = tempfile::tempdir().unwrap();
+        let proxy_trap = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut config = test_config();
+        config.mirror_proxy =
+            Some(Url::parse(&format!("socks5h://{}", proxy_trap.local_addr().unwrap())).unwrap());
+        let state = AppState::new(open_store(&directory), config).unwrap();
+        let hash = "a".repeat(64);
+        let response = router(state.clone())
+            .oneshot(native_mirror_request(&hash, unix_time(), 1))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(
+            std::str::from_utf8(&body)
+                .unwrap()
+                .contains("not supported by the configured transport")
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), proxy_trap.accept())
+                .await
+                .is_err()
+        );
+        assert_eq!(state.store().stats().unwrap().blobs, 0);
     }
 
     async fn stored_blobs(app: &Router) -> (u64, u64) {

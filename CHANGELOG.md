@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.5.1 - unreleased
+
+- Restore the joint contract's native `fsl://` mirror path through the
+  explicitly supplied `BlobFetcher`. Source validation, scoped authorisation,
+  quota reservation, hashing and atomic commit remain in the core; native URLs
+  with credentials, ports, queries, fragments or extra path segments are
+  refused before fetching. The core never resolves the native URL itself.
+- No schema, wire-format or public API change; schema 6 remains in use.
+
 ## 0.5.0 - 2026-10-04
 
 - Add operator-owned paid capacity holds, idempotent activation and renewal;
