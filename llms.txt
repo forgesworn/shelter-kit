@@ -1,0 +1,65 @@
+# shelter-kit
+
+> Building a Blossom (BUD-01 etc.) blob store means writing content
+> addressing, retention, mirror repair and BUD authorisation again for every
+> product. shelter-kit is a transport-neutral Rust core for a secure,
+> content-addressed Blossom store, factored out so storage policy is not
+> coupled to one network listener or UI.
+
+It is a library, not a daemon: a product supplies the listener, transport and
+user experience (Tor, direct HTTPS, or another adapter), and shelter-kit
+supplies the unbound Axum router, BUD authorisation, streaming
+content-addressed store, retention policy, and verified mirror/repair path.
+Wildbloom Node and Bothy are separate products built on the same core because
+publishing and private shelter have different consent and failure modes.
+
+## Getting Started
+
+```toml
+[dependencies]
+shelter-kit = { git = "https://github.com/forgesworn/shelter-kit", tag = "v0.4.1" }
+```
+
+```rust
+use shelter_kit::{AppState, BlossomConfig, Store, StoreConfig, router};
+
+let store = Store::open(store_config)?;
+let state = AppState::new(store, blossom_config)?;
+let app = router(state);
+```
+
+Mount `app` into the product's own listener.
+
+## Key Concepts
+
+- `Store` - content-addressed storage: streaming reserve, hash verification,
+  retention tiers, eviction, integrity scanning and repair.
+- `AppState` - the BUD router's state: owner keys, friend grants and quota,
+  each re-suppliable at runtime and swapped at a reconcile boundary.
+- `AuthPolicy` - verifies BUD-01 upload, delete and list events against
+  accepted servers and, optionally, an allowed pubkey set.
+- `BlobFetcher` - the transport boundary for mirroring and repair, kept
+  separate from authorisation and storage; `DirectHttpsFetcher` and
+  `TorHttpFetcher` are the supplied adapters.
+- `AdmissionFilter` - an optional, deterministic, I/O-free check on the
+  first bytes of an upload, mirror or repair (`SealedParcelsOnly` is
+  supplied).
+
+## API Surface
+
+- `router(state: AppState) -> Router` - the BUD route set.
+- `Store::open`, `Store::open_with_admission_filter`, `Store::begin_upload`,
+  `Store::begin_claimed_upload`, `Store::begin_claimed_mirror`,
+  `Store::write_tombstone`, `Store::verify_integrity`,
+  `Store::repair_candidates`, `Store::begin_repair`.
+- `AppState::new`, `AppState::with_fetcher`, `AppState::set_owner_keys`,
+  `AppState::set_friend_grants`, `AppState::set_quota`,
+  `AppState::reconcile_now`, `AppState::write_tombstone`.
+- `AuthPolicy::new`, `with_allowed_pubkeys`, `with_public_writes`,
+  `verify_upload`, `verify_delete`, `verify_list`.
+
+## Optional
+
+- Full runtime policy and quota semantics: [README.md](README.md#runtime-policy)
+- Compatibility promise: [CORE-CONTRACT.md](CORE-CONTRACT.md)
+- Version history: [CHANGELOG.md](CHANGELOG.md)
