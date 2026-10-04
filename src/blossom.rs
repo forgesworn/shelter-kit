@@ -796,6 +796,59 @@ async fn health(State(state): State<AppState>) -> Result<Json<HealthResponse>, A
     }))
 }
 
+async fn upload_claim(
+    state: &AppState,
+    policy: &Policy,
+    authorization: Option<&str>,
+    hash: &str,
+    content_type: &str,
+    allow_guest: bool,
+) -> Result<(crate::auth::VerifiedUpload, ClaimSpec), ApiError> {
+    let now = unix_time();
+    let verified = match policy.trusted_auth.verify_upload(authorization, hash, now) {
+        Ok(verified) => verified,
+        Err(AuthError::PubkeyNotAllowed) => state
+            .inner
+            .public_auth
+            .verify_upload(authorization, hash, now)
+            .map_err(ApiError::from_auth)?,
+        Err(error) => return Err(ApiError::from_auth(error)),
+    };
+    if policy.owner_pubkeys.contains(&verified.owner_pubkey) {
+        let claim = policy.trusted_claim(
+            &verified.owner_pubkey,
+            content_type,
+            verified.class.clone(),
+            now,
+        )?;
+        return Ok((verified, claim));
+    }
+    let store = state.inner.store.clone();
+    let signer = verified.owner_pubkey.clone();
+    let declared_type = content_type.to_owned();
+    let class = verified.class.clone();
+    let paid = spawn_blocking(move || store.paid_claim(&signer, &declared_type, class))
+        .await
+        .map_err(|_| ApiError::internal())?
+        .map_err(ApiError::from_store)?;
+    let claim = if let Some(claim) = paid {
+        claim
+    } else if allow_guest && !policy.friend_grants.contains_key(&verified.owner_pubkey) {
+        policy.guest_claim(&verified.owner_pubkey, content_type, verified.class.clone())?
+    } else {
+        if !policy.friend_grants.contains_key(&verified.owner_pubkey) {
+            return Err(ApiError::from_auth(AuthError::PubkeyNotAllowed));
+        }
+        policy.trusted_claim(
+            &verified.owner_pubkey,
+            content_type,
+            verified.class.clone(),
+            now,
+        )?
+    };
+    Ok((verified, claim))
+}
+
 async fn upload(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -826,16 +879,15 @@ async fn upload(
     let authorization = headers
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok());
-    let verified = policy
-        .trusted_auth
-        .verify_upload(authorization, &expected_hash, unix_time())
-        .map_err(ApiError::from_auth)?;
-    let claim = policy.trusted_claim(
-        &verified.owner_pubkey,
+    let (_, claim) = upload_claim(
+        &state,
+        &policy,
+        authorization,
+        &expected_hash,
         &content_type,
-        verified.class,
-        unix_time(),
-    )?;
+        false,
+    )
+    .await?;
     // The store normalises the class the same way the event parser does, so
     // the descriptor reports exactly what was recorded.
     let claim_class = claim.class.clone();
@@ -930,16 +982,15 @@ async fn upload_preflight(
     let authorization = headers
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok());
-    let verified = policy
-        .trusted_auth
-        .verify_upload(authorization, expected_hash, unix_time())
-        .map_err(ApiError::from_auth)?;
-    let claim = policy.trusted_claim(
-        &verified.owner_pubkey,
+    let (_, claim) = upload_claim(
+        &state,
+        &policy,
+        authorization,
+        expected_hash,
         content_type,
-        verified.class,
-        unix_time(),
-    )?;
+        false,
+    )
+    .await?;
     let store = state.inner.store.clone();
     let expected_hash = expected_hash.to_owned();
     spawn_blocking(move || store.check_claimed_upload(&expected_hash, expected_size, &claim))
@@ -983,36 +1034,15 @@ async fn mirror(
     let authorization = headers
         .get(AUTHORIZATION)
         .and_then(|value| value.to_str().ok());
-    let now = unix_time();
-    let (verified, mut claim) =
-        match policy
-            .trusted_auth
-            .verify_upload(authorization, &expected_hash, now)
-        {
-            Ok(verified) => {
-                let claim = policy.trusted_claim(
-                    &verified.owner_pubkey,
-                    "application/octet-stream",
-                    verified.class.clone(),
-                    now,
-                )?;
-                (verified, claim)
-            }
-            Err(AuthError::PubkeyNotAllowed) if policy.open_shelter => {
-                let verified = state
-                    .inner
-                    .public_auth
-                    .verify_upload(authorization, &expected_hash, now)
-                    .map_err(ApiError::from_auth)?;
-                let claim = policy.guest_claim(
-                    &verified.owner_pubkey,
-                    "application/octet-stream",
-                    verified.class.clone(),
-                )?;
-                (verified, claim)
-            }
-            Err(error) => return Err(ApiError::from_auth(error)),
-        };
+    let (verified, mut claim) = upload_claim(
+        &state,
+        &policy,
+        authorization,
+        &expected_hash,
+        "application/octet-stream",
+        true,
+    )
+    .await?;
 
     let check_store = state.inner.store.clone();
     let check_hash = expected_hash.clone();
@@ -1614,6 +1644,11 @@ impl ApiError {
                 message: "storage quota is full",
                 range_size: None,
             },
+            StoreError::PaidAllowanceUnavailable => Self {
+                status: StatusCode::INSUFFICIENT_STORAGE,
+                message: "paid storage allowance is full or expired",
+                range_size: None,
+            },
             StoreError::FriendLimitExceeded => Self {
                 status: StatusCode::INSUFFICIENT_STORAGE,
                 message: "friend storage grant is full or expired",
@@ -1773,6 +1808,139 @@ mod tests {
                 &Url::parse(&format!("http://user@{}.onion/{hash}.bin", "b".repeat(56))).unwrap()
             )
             .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn paid_signer_uses_bud_auth_and_recovers_claims_without_an_owner_grant() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = open_store(&directory);
+        let now = unix_time();
+        let sale = crate::PaidSale {
+            order_id: "paid-order".into(),
+            signer_pubkey: pubkey_for(2),
+            capacity_bytes: 16,
+            duration_seconds: 3600,
+            grace_seconds: 600,
+            hold_expires_at: now + 300,
+            renews: None,
+        };
+        store.reserve_paid_sale(&sale).unwrap();
+        let state = AppState::new(store.clone(), test_config()).unwrap();
+        let app = router(state.clone());
+        // A quote, without settled activation, grants no upload authority.
+        assert_eq!(
+            app.clone()
+                .oneshot(upload_request(2, b"paid", now))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        store.activate_paid_sale("paid-order").unwrap();
+        assert_eq!(
+            app.clone()
+                .oneshot(upload_request(3, b"paid", now))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(upload_request(2, b"paid", now - 3600))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let hash = hex::encode(Sha256::digest(b"paid"));
+        let preflight = Request::builder()
+            .method(Method::HEAD)
+            .uri("/upload")
+            .header(&X_CONTENT_TYPE, "text/plain")
+            .header(&X_CONTENT_LENGTH, 4)
+            .header(&X_SHA_256, &hash)
+            .header(
+                AUTHORIZATION,
+                operation_authorization_for(2, Some(&hash), now, "upload"),
+            )
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(preflight).await.unwrap().status(),
+            StatusCode::OK
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(upload_request(2, b"paid", now))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CREATED
+        );
+        assert_eq!(
+            store.get(&hash).unwrap().unwrap().retention_tier,
+            RetentionTier::Paid
+        );
+        // Friend policy changes cannot hide or demote independently purchased claims.
+        state
+            .set_friend_grants(vec![friend_grant(2, "friend", 1, now)])
+            .await
+            .unwrap();
+        assert!(listed_classes(&app, 2, now).await.contains_key(&hash));
+        state.set_friend_grants(vec![]).await.unwrap();
+        assert!(listed_classes(&app, 2, now).await.contains_key(&hash));
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/{hash}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()[CONTENT_TYPE], "application/octet-stream");
+        assert_eq!(
+            response
+                .into_body()
+                .collect()
+                .await
+                .unwrap()
+                .to_bytes()
+                .as_ref(),
+            b"paid"
+        );
+        assert_eq!(
+            app.clone()
+                .oneshot(upload_request(2, &[1; 13], now))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::INSUFFICIENT_STORAGE
+        );
+        let wrong_hash = Request::builder()
+            .method(Method::PUT)
+            .uri("/upload")
+            .header(CONTENT_TYPE, "text/plain")
+            .header(CONTENT_LENGTH, 4)
+            .header(&X_SHA_256, &hash)
+            .header(
+                AUTHORIZATION,
+                operation_authorization_for(
+                    2,
+                    Some(&hex::encode(Sha256::digest(b"else"))),
+                    now,
+                    "upload",
+                ),
+            )
+            .body(Body::from("paid"))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(wrong_hash).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
         );
     }
 

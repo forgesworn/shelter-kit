@@ -4,6 +4,7 @@ pub mod admission;
 pub mod auth;
 pub mod blossom;
 pub mod fetch;
+pub mod paid;
 pub mod store;
 
 pub use admission::{AdmissionDecision, AdmissionFilter, SealedParcelsOnly};
@@ -20,3 +21,5 @@ pub use store::{
     RepairCandidate, RepairReservation, RepairSource, RetentionTier, Store, StoreConfig,
     StoreError, Tombstone,
 };
+
+pub use paid::{PaidAllowance, PaidSale};

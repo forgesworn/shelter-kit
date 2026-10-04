@@ -62,4 +62,5 @@ src/
 - Mirroring cannot reverse a tombstone; only a fresh, valid owner upload
   clears it.
 - Schema 5 data (tombstones) must not be opened with a core older than
-  0.4.0, including during a rollback.
+  0.4.0, including during a rollback. Schema 6 in 0.5.0 adds paid claims;
+  older cores refuse it. Do not lower the schema version to bypass that check.
