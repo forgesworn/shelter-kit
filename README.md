@@ -101,7 +101,7 @@ moved, not evidence that another machine will retain them.
 
 ```toml
 [dependencies]
-shelter-kit = { git = "https://github.com/forgesworn/shelter-kit", tag = "v0.4.1" }
+shelter-kit = { git = "https://github.com/forgesworn/shelter-kit", tag = "v0.5.0" }
 ```
 
 Create a `Store`, build an `AppState` from a `BlossomConfig`, optionally supply
@@ -178,3 +178,10 @@ received an independent security audit.  Do not treat it as a backup or custody
 promise without independent replicas, monitoring and recovery evidence.
 
 MIT licensed.  Sponsorship links are in [.github/FUNDING.yml](.github/FUNDING.yml).
+
+## Paid storage core (0.5.0 prerelease)
+
+Version 0.5.0 adds protected paid allowances, bounded sale holds, atomic
+activation/renewal and schema 6. See [the storage contract](PAID-STORAGE.md) for
+capacity accounting, migration, API boundaries and remaining checkout work.
+This source implementation does not enable payments in a released Node.

@@ -28,6 +28,7 @@ pub struct StoreConfig {
 pub enum RetentionTier {
     Guest,
     Friend,
+    Paid,
     Owner,
 }
 
@@ -36,6 +37,7 @@ impl RetentionTier {
         match self {
             Self::Guest => "guest",
             Self::Friend => "friend",
+            Self::Paid => "paid",
             Self::Owner => "owner",
         }
     }
@@ -44,6 +46,7 @@ impl RetentionTier {
         match value {
             "guest" => Ok(Self::Guest),
             "friend" => Ok(Self::Friend),
+            "paid" => Ok(Self::Paid),
             "owner" => Ok(Self::Owner),
             _ => Err(StoreError::InvalidTier),
         }
@@ -216,6 +219,8 @@ pub struct StoreStats {
     pub blobs: u64,
     pub bytes: u64,
     pub reserved_bytes: u64,
+    /// Includes sold capacity and live quote holds, not just physical bytes.
+    pub committed_bytes: u64,
     pub quota_bytes: u64,
 }
 
@@ -256,6 +261,10 @@ pub enum StoreError {
     BlobTooLarge { size: u64, limit: u64 },
     #[error("the configured storage quota is full")]
     QuotaExceeded,
+    #[error("invalid or conflicting paid sale")]
+    InvalidPaidSale,
+    #[error("paid allowance is missing, expired or exhausted")]
+    PaidAllowanceUnavailable,
     #[error("the friend grant byte ceiling is exhausted")]
     FriendLimitExceeded,
     #[error("content length does not match the stored blob")]
@@ -335,6 +344,7 @@ impl Store {
         store.initialise_database()?;
         store.clear_interrupted_uploads()?;
         store.reap_expired_claims()?;
+        store.set_quota_bytes(store.quota_bytes())?;
         Ok(store)
     }
 
@@ -361,8 +371,8 @@ impl Store {
     /// Validated exactly like [`StoreConfig::quota_bytes`] at construction:
     /// at least 2 bytes, and no more than `i64::MAX`. Refused, leaving the
     /// live quota untouched, when the store currently holds more bytes than
-    /// `bytes` allows for — stored blobs plus in-flight reservations,
-    /// counted the same way [`Store::stats`] counts them.
+    /// `bytes` allows for — physical bytes, in-flight reservations and paid
+    /// capacity commitments, as reported by [`Store::committed_bytes`].
     ///
     /// On success the new value takes effect immediately for every
     /// subsequent watermark and reservation decision across every clone of
@@ -376,13 +386,9 @@ impl Store {
         if bytes < 2 {
             return Err(StoreError::InvalidWatermarks);
         }
-        let connection = self.connection()?;
-        let used: i64 = connection.query_row(
-            "SELECT COALESCE((SELECT SUM(size) FROM blobs), 0) + \
-                    COALESCE((SELECT SUM(size) FROM reservations), 0)",
-            [],
-            |row| row.get(0),
-        )?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let used: i64 = crate::paid::committed_usage(&transaction, unix_time()?)?;
         let used = u64::try_from(used).map_err(|_| StoreError::IntegerRange)?;
         if bytes < used {
             return Err(StoreError::QuotaBelowUsage {
@@ -391,6 +397,7 @@ impl Store {
             });
         }
         self.live_quota_bytes.store(bytes, Ordering::SeqCst);
+        transaction.commit()?;
         Ok(())
     }
 
@@ -406,12 +413,7 @@ impl Store {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         let now = unix_time()?;
-        let used: i64 = transaction.query_row(
-            "SELECT COALESCE((SELECT SUM(size) FROM blobs), 0) + \
-                    COALESCE((SELECT SUM(size) FROM reservations), 0)",
-            [],
-            |row| row.get(0),
-        )?;
+        let used: i64 = crate::paid::committed_usage(&transaction, now)?;
         let quota = i64::try_from(self.quota_bytes()).map_err(|_| StoreError::IntegerRange)?;
         let (low, high) = self.watermarks()?;
         let low = i64::try_from(low).map_err(|_| StoreError::IntegerRange)?;
@@ -506,21 +508,26 @@ impl Store {
                 return Err(StoreError::LengthMismatch);
             }
             self.inspect_path(&self.blob_path(expected_hash))?;
-            enforce_friend_limit(&transaction, &claim, expected_hash, expected_size, now)?;
+            enforce_claim_limit(&transaction, &claim, expected_hash, expected_size, now)?;
             upsert_claim(&transaction, expected_hash, &claim, now)?;
+            if crate::paid::committed_usage(&transaction, now)? > self.quota_bytes() as i64 {
+                return Err(StoreError::QuotaExceeded);
+            }
             let metadata =
                 query_blob(&transaction, expected_hash)?.ok_or(StoreError::MissingBlob)?;
             transaction.commit()?;
             return Ok(UploadStart::Existing(metadata));
         }
 
-        enforce_friend_limit(&transaction, &claim, expected_hash, expected_size, now)?;
-        let mut used: i64 = transaction.query_row(
-            "SELECT COALESCE((SELECT SUM(size) FROM blobs), 0) + \
-                    COALESCE((SELECT SUM(size) FROM reservations), 0)",
-            [],
-            |row| row.get(0),
-        )?;
+        enforce_claim_limit(&transaction, &claim, expected_hash, expected_size, now)?;
+        let mut used: i64 = crate::paid::committed_usage(&transaction, now)?;
+        used = used.saturating_sub(crate::paid::write_credit(
+            &transaction,
+            &claim,
+            expected_hash,
+            expected_size,
+            now,
+        )?);
         let quota = i64::try_from(self.quota_bytes()).map_err(|_| StoreError::IntegerRange)?;
         let (low, high) = self.watermarks()?;
         let low = i64::try_from(low).map_err(|_| StoreError::IntegerRange)?;
@@ -533,7 +540,7 @@ impl Store {
                     return Err(StoreError::QuotaExceeded);
                 }
             }
-            RetentionTier::Owner | RetentionTier::Friend => {
+            RetentionTier::Owner | RetentionTier::Friend | RetentionTier::Paid => {
                 let must_free = used
                     .saturating_add(expected_size_i64)
                     .saturating_sub(quota)
@@ -722,16 +729,13 @@ impl Store {
             if stored_size != expected_size {
                 return Err(StoreError::LengthMismatch);
             }
-            enforce_friend_limit(&connection, claim, expected_hash, expected_size, now)?;
+            enforce_claim_limit(&connection, claim, expected_hash, expected_size, now)?;
             return Ok(());
         }
-        enforce_friend_limit(&connection, claim, expected_hash, expected_size, now)?;
-        let used: i64 = connection.query_row(
-            "SELECT COALESCE((SELECT SUM(size) FROM blobs), 0) + \
-                    COALESCE((SELECT SUM(size) FROM reservations), 0)",
-            [],
-            |row| row.get(0),
-        )?;
+        enforce_claim_limit(&connection, claim, expected_hash, expected_size, now)?;
+        let used = crate::paid::committed_usage(&connection, now)?.saturating_sub(
+            crate::paid::write_credit(&connection, claim, expected_hash, expected_size, now)?,
+        );
         let quota = i64::try_from(self.quota_bytes()).map_err(|_| StoreError::IntegerRange)?;
         let (_, high) = self.watermarks()?;
         match claim.retention_tier {
@@ -741,7 +745,7 @@ impl Store {
                     return Err(StoreError::QuotaExceeded);
                 }
             }
-            RetentionTier::Owner | RetentionTier::Friend => {
+            RetentionTier::Owner | RetentionTier::Friend | RetentionTier::Paid => {
                 let evictable: i64 = connection.query_row(
                     "SELECT COALESCE(SUM(b.size), 0)
                      FROM blobs b
@@ -749,7 +753,7 @@ impl Store {
                        SELECT 1 FROM claims c
                        WHERE c.hash = b.hash
                          AND (c.claim_expires_at IS NULL OR c.claim_expires_at > ?1)
-                         AND c.retention_tier IN ('owner', 'friend')
+                         AND c.retention_tier IN ('owner', 'friend', 'paid')
                      )",
                     [now],
                     |row| row.get(0),
@@ -803,6 +807,11 @@ impl Store {
             blobs: u64::try_from(blobs).map_err(|_| StoreError::IntegerRange)?,
             bytes: u64::try_from(bytes).map_err(|_| StoreError::IntegerRange)?,
             reserved_bytes: u64::try_from(reserved).map_err(|_| StoreError::IntegerRange)?,
+            committed_bytes: u64::try_from(crate::paid::committed_usage(
+                &connection,
+                unix_time()?,
+            )?)
+            .map_err(|_| StoreError::IntegerRange)?,
             quota_bytes: self.quota_bytes(),
         })
     }
@@ -816,7 +825,8 @@ impl Store {
         self.list_claims_scoped(signer_pubkey, None, cursor, limit)
     }
 
-    /// List only active friend claims belonging to the supplied current grant.
+    /// List active friend claims belonging to the supplied current grant, plus
+    /// independently retained paid claims for the same signer (including grace).
     /// The caller is responsible for authenticating the signer and grant.
     pub fn list_claims_for_grant(
         &self,
@@ -850,7 +860,7 @@ impl Store {
                         "SELECT created_at FROM claims
                          WHERE signer_pubkey = ?1 AND hash = ?2
                            AND (claim_expires_at IS NULL OR claim_expires_at > ?3)
-                           AND (?4 IS NULL OR (grant_id = ?4 AND retention_tier = 'friend'))",
+                           AND (?4 IS NULL OR retention_tier = 'paid' OR (grant_id = ?4 AND retention_tier = 'friend'))",
                         params![signer_pubkey, cursor, now, grant_id],
                         |row| row.get::<_, i64>(0),
                     )
@@ -865,7 +875,7 @@ impl Store {
              WHERE c.signer_pubkey = ?1
                AND (c.claim_expires_at IS NULL OR c.claim_expires_at > ?2)
                AND (?3 IS NULL OR c.created_at < ?3 OR (c.created_at = ?3 AND c.hash > ?4))
-               AND (?6 IS NULL OR (c.grant_id = ?6 AND c.retention_tier = 'friend'))
+               AND (?6 IS NULL OR c.retention_tier = 'paid' OR (c.grant_id = ?6 AND c.retention_tier = 'friend'))
              ORDER BY c.created_at DESC, c.hash ASC
              LIMIT ?5",
         )?;
@@ -1204,7 +1214,7 @@ impl Store {
                 RetentionTier::Friend => grant_id.is_some_and(|grant_id| {
                     active_friend_grants.contains(&(signer.clone(), grant_id))
                 }),
-                RetentionTier::Guest => true,
+                RetentionTier::Guest | RetentionTier::Paid => true,
             };
             if !permitted {
                 transaction.execute(
@@ -1232,7 +1242,7 @@ impl Store {
                SELECT 1 FROM claims c
                WHERE c.hash = b.hash
                  AND (c.claim_expires_at IS NULL OR c.claim_expires_at > ?1)
-                 AND c.retention_tier IN ('owner', 'friend')
+                 AND c.retention_tier IN ('owner', 'friend', 'paid')
              )
              ORDER BY b.created_at ASC, b.hash ASC",
         )?;
@@ -1277,7 +1287,7 @@ impl Store {
         Ok(evictions)
     }
 
-    fn connection(&self) -> Result<Connection, StoreError> {
+    pub(crate) fn connection(&self) -> Result<Connection, StoreError> {
         let connection = Connection::open(&self.database_path)?;
         connection.busy_timeout(std::time::Duration::from_secs(5))?;
         connection.execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;")?;
@@ -1287,7 +1297,7 @@ impl Store {
     fn initialise_database(&self) -> Result<(), StoreError> {
         let connection = self.connection()?;
         let version: i64 = connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
-        if version > 5 {
+        if version > 6 {
             return Err(StoreError::UnsupportedSchema(version));
         }
         connection.execute_batch(
@@ -1315,7 +1325,7 @@ impl Store {
                 hash TEXT NOT NULL REFERENCES blobs(hash) ON DELETE CASCADE,
                 signer_pubkey TEXT NOT NULL,
                 retention_tier TEXT NOT NULL
-                    CHECK (retention_tier IN ('owner', 'friend', 'guest')),
+                    CHECK (retention_tier IN ('owner', 'friend', 'paid', 'guest')),
                 declared_type TEXT NOT NULL,
                 grant_id TEXT,
                 claim_expires_at INTEGER,
@@ -1337,7 +1347,7 @@ impl Store {
                 hash TEXT NOT NULL,
                 size INTEGER NOT NULL CHECK (size >= 0),
                 retention_tier TEXT NOT NULL
-                    CHECK (retention_tier IN ('owner', 'friend', 'guest')),
+                    CHECK (retention_tier IN ('owner', 'friend', 'paid', 'guest')),
                 signer_pubkey TEXT NOT NULL,
                 declared_type TEXT NOT NULL,
                 grant_id TEXT,
@@ -1379,7 +1389,30 @@ impl Store {
                 [],
             )?;
         }
-        connection.execute_batch("PRAGMA user_version = 5;")?;
+        // Rebuild the old CHECK constraint in one transaction. Claims remain private
+        // to this store; older cores must refuse schema 6 rather than demote paid data.
+        if version < 6 {
+            connection.execute_batch(
+                "BEGIN IMMEDIATE;
+                 CREATE TABLE claims_v6 (
+                    hash TEXT NOT NULL REFERENCES blobs(hash) ON DELETE CASCADE,
+                    signer_pubkey TEXT NOT NULL,
+                    retention_tier TEXT NOT NULL CHECK (retention_tier IN ('owner','friend','paid','guest')),
+                    declared_type TEXT NOT NULL, grant_id TEXT, claim_expires_at INTEGER,
+                    created_at INTEGER NOT NULL, class TEXT,
+                    PRIMARY KEY (signer_pubkey, hash)
+                 );
+                 INSERT INTO claims_v6 SELECT hash, signer_pubkey, retention_tier,
+                    declared_type, grant_id, claim_expires_at, created_at, class FROM claims;
+                 DROP TABLE claims;
+                 ALTER TABLE claims_v6 RENAME TO claims;
+                 CREATE INDEX claims_hash_active ON claims(hash, retention_tier, claim_expires_at);
+                 CREATE INDEX claims_signer_list ON claims(signer_pubkey, created_at DESC, hash);
+                 COMMIT;",
+            )?;
+        }
+        crate::paid::initialise(&connection)?;
+        connection.execute_batch("PRAGMA user_version = 6;")?;
         set_private_file_permissions(&self.database_path)?;
         Ok(())
     }
@@ -1564,6 +1597,16 @@ impl UploadReservation {
         )?;
 
         let uploaded = unix_time()?;
+        if self.claim.retention_tier == RetentionTier::Paid {
+            transaction.execute("DELETE FROM reservations WHERE id = ?1", [&self.id])?;
+            crate::paid::enforce_limit(
+                &transaction,
+                &self.claim,
+                &self.expected_hash,
+                self.expected_size,
+                uploaded,
+            )?;
+        }
         if let Some((_, stored_size, _)) = query_blob_row(&transaction, &self.expected_hash)? {
             if stored_size != self.expected_size {
                 return Err(StoreError::LengthMismatch);
@@ -1656,6 +1699,14 @@ fn validate_claim(claim: &ClaimSpec) -> Result<(), StoreError> {
                 && claim.claim_expires_at.is_none()
                 && claim.byte_limit.is_none()
         }
+        RetentionTier::Paid => {
+            claim
+                .grant_id
+                .as_deref()
+                .is_some_and(|id| !id.is_empty() && id.len() <= 128)
+                && claim.claim_expires_at.is_none()
+                && claim.byte_limit.is_none()
+        }
         RetentionTier::Friend => {
             claim
                 .grant_id
@@ -1668,13 +1719,16 @@ fn validate_claim(claim: &ClaimSpec) -> Result<(), StoreError> {
     valid.then_some(()).ok_or(StoreError::InvalidTier)
 }
 
-fn enforce_friend_limit(
+fn enforce_claim_limit(
     connection: &Connection,
     claim: &ClaimSpec,
     expected_hash: &str,
     expected_size: u64,
     now: i64,
 ) -> Result<(), StoreError> {
+    if claim.retention_tier == RetentionTier::Paid {
+        return crate::paid::enforce_limit(connection, claim, expected_hash, expected_size, now);
+    }
     if claim.retention_tier != RetentionTier::Friend {
         return Ok(());
     }
@@ -1726,16 +1780,34 @@ fn upsert_claim(
     claim: &ClaimSpec,
     created_at: i64,
 ) -> Result<(), StoreError> {
+    let paid_expiry = if claim.retention_tier == RetentionTier::Paid {
+        Some(crate::paid::retention_end(connection, claim, created_at)?)
+    } else {
+        claim
+            .claim_expires_at
+            .map(i64::try_from)
+            .transpose()
+            .map_err(|_| StoreError::IntegerRange)?
+    };
     connection.execute(
         "INSERT INTO claims
          (hash, signer_pubkey, retention_tier, declared_type,
           grant_id, claim_expires_at, class, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
          ON CONFLICT(signer_pubkey, hash) DO UPDATE SET
-           retention_tier = excluded.retention_tier,
+           retention_tier = CASE
+             WHEN claims.retention_tier = 'paid' AND claims.claim_expires_at > ?8
+                  AND excluded.retention_tier != 'paid' THEN claims.retention_tier
+             ELSE excluded.retention_tier END,
            declared_type = excluded.declared_type,
-           grant_id = excluded.grant_id,
-           claim_expires_at = excluded.claim_expires_at,
+           grant_id = CASE
+             WHEN claims.retention_tier = 'paid' AND claims.claim_expires_at > ?8
+                  AND excluded.retention_tier != 'paid' THEN claims.grant_id
+             ELSE excluded.grant_id END,
+           claim_expires_at = CASE
+             WHEN claims.retention_tier = 'paid' AND claims.claim_expires_at > ?8
+                  AND excluded.retention_tier != 'paid' THEN claims.claim_expires_at
+             ELSE excluded.claim_expires_at END,
            class = excluded.class,
            created_at = excluded.created_at",
         params![
@@ -1744,11 +1816,7 @@ fn upsert_claim(
             claim.retention_tier.as_str(),
             claim.declared_type,
             claim.grant_id,
-            claim
-                .claim_expires_at
-                .map(i64::try_from)
-                .transpose()
-                .map_err(|_| StoreError::IntegerRange)?,
+            paid_expiry,
             normalised_class(claim.class.as_deref()),
             created_at
         ],
@@ -1858,7 +1926,7 @@ fn validate_hash(hash: &str) -> Result<(), StoreError> {
     Ok(())
 }
 
-fn unix_time() -> Result<i64, StoreError> {
+pub(crate) fn unix_time() -> Result<i64, StoreError> {
     let seconds = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_err(|error| StoreError::Io(std::io::Error::other(error)))?
@@ -2186,7 +2254,7 @@ mod tests {
             .unwrap();
         drop(store);
         let store = Store::open(config.clone()).unwrap();
-        assert_eq!(user_version(&config.root), 5);
+        assert_eq!(user_version(&config.root), 6);
         assert_eq!(store.last_verified(&hash).unwrap(), verified);
         assert_eq!(store.repair_sources(&hash).unwrap(), source);
         assert_eq!(store.list_claims("owner", None, 100).unwrap().len(), 1);
@@ -2196,14 +2264,14 @@ mod tests {
         store
             .connection()
             .unwrap()
-            .execute_batch("PRAGMA user_version = 6;")
+            .execute_batch("PRAGMA user_version = 7;")
             .unwrap();
         drop(store);
         assert!(matches!(
             Store::open(config.clone()),
-            Err(StoreError::UnsupportedSchema(6))
+            Err(StoreError::UnsupportedSchema(7))
         ));
-        assert_eq!(user_version(&config.root), 6);
+        assert_eq!(user_version(&config.root), 7);
         assert!(interrupted.exists());
     }
 
@@ -2297,14 +2365,14 @@ mod tests {
         assert_eq!(claims.len(), 1);
         assert_eq!(claims[0].sha256, hash);
         assert_eq!(claims[0].class, None);
-        assert_eq!(user_version(&root), 5);
+        assert_eq!(user_version(&root), 6);
         assert_eq!(store.last_verified(&hash).unwrap(), None);
 
         // Idempotent: opening a migrated store again changes nothing.
         drop(store);
         let store = Store::open(config).unwrap();
         assert_eq!(store.list_claims(&signer, None, 10).unwrap()[0].class, None);
-        assert_eq!(user_version(&root), 5);
+        assert_eq!(user_version(&root), 6);
     }
 
     #[test]

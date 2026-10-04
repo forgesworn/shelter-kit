@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.5.0 - 2026-10-04
+
+- Add operator-owned paid capacity holds, idempotent activation and renewal;
+  refuse overselling through concurrent sales, uploads or quota changes.
+- Add a protected paid claim tier with write expiry and recovery grace, while
+  preserving deduplicated files claimed by other signers.
+- Resolve activated allowances after existing BUD authorisation in uploads,
+  preflight and mirrors; include paid claims in signer recovery listings.
+- Add `StoreStats.committed_bytes` and migrate existing stores to schema 6.
+  Consumers must account for the new public enum variant and statistics field;
+  this minor release requires consumer review. Older cores cannot reopen schema 6.
+- No checkout endpoint, payment rail or automatic settlement is included.
+
 ## 0.4.1 - 2026-09-05
 
 - Serialise concurrent owner-set and friend-grant updates across their
