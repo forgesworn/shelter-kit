@@ -11,6 +11,8 @@
 - Add `StoreStats.committed_bytes` and migrate existing stores to schema 6.
   Consumers must account for the new public enum variant and statistics field;
   this minor release requires consumer review. Older cores cannot reopen schema 6.
+- Require rustls 0.23.45 and update locked faster-hex to 0.10.1 for
+  RUSTSEC-2026-0285 and RUSTSEC-2026-0306.
 - No checkout endpoint, payment rail or automatic settlement is included.
 
 ## 0.4.1 - 2026-09-05
