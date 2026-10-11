@@ -96,6 +96,17 @@ impl Store {
     /// live record is harmless; expired holds are refused. Holds last at most a day.
     /// New sales conservatively require free space; they do not evict guest blobs.
     pub fn reserve_paid_sale(&self, sale: &PaidSale) -> Result<(), StoreError> {
+        self.reserve_paid_sale_with_ceiling(sale, i64::MAX as u64)
+    }
+
+    /// Atomically cap customer commitments independently of the total store quota.
+    /// Full allowances count through retention grace; renewal holds count once.
+    /// Existing holds remain honourable if an operator later lowers the ceiling.
+    pub fn reserve_paid_sale_with_ceiling(
+        &self,
+        sale: &PaidSale,
+        max_paid_bytes: u64,
+    ) -> Result<(), StoreError> {
         if !valid_id(&sale.order_id)
             || sale.renews.as_deref().is_some_and(|id| !valid_id(id))
             || sale.signer_pubkey.len() != 64
@@ -166,7 +177,20 @@ impl Store {
         tx.execute("INSERT INTO paid_sales (id, signer, capacity, duration, grace, expires, renews) VALUES (?1,?2,?3,?4,?5,?6,?7)",
             params![sale.order_id, sale.signer_pubkey, as_i64(sale.capacity_bytes)?, as_i64(sale.duration_seconds)?,
                 as_i64(sale.grace_seconds)?, as_i64(sale.hold_expires_at)?, sale.renews])?;
-        if committed_usage(&tx, now)? > as_i64(self.quota_bytes())? {
+        // This check shares the transaction with insertion, so simultaneous
+        // buyers cannot each reserve the same remaining seller capacity.
+        let sold: i64 = tx.query_row(
+            "SELECT COALESCE((SELECT SUM(capacity) FROM paid_allowances a
+                WHERE retains > ?1 OR EXISTS (SELECT 1 FROM paid_sales s
+                    WHERE s.renews=a.id AND s.activated IS NULL AND s.expires > ?1)),0)
+             + COALESCE((SELECT SUM(capacity) FROM paid_sales
+                WHERE activated IS NULL AND expires > ?1 AND renews IS NULL),0)",
+            [now],
+            |row| row.get(0),
+        )?;
+        if sold > as_i64(max_paid_bytes)?
+            || committed_usage(&tx, now)? > as_i64(self.quota_bytes())?
+        {
             return Err(StoreError::QuotaExceeded);
         }
         tx.commit()?;
@@ -417,6 +441,55 @@ mod tests {
             )
             .unwrap();
     }
+    #[test]
+    fn seller_ceiling_preserves_owner_space_and_survives_restart() {
+        let (_dir, store) = store(100);
+        let first = sale("first", 1, 60);
+        store.reserve_paid_sale_with_ceiling(&first, 60).unwrap();
+        assert!(matches!(
+            store.reserve_paid_sale_with_ceiling(&sale("extra", 2, 1), 60),
+            Err(StoreError::QuotaExceeded)
+        ));
+        put(&store, &[5; 40], owner("owner"));
+        let config = store.config();
+        drop(store);
+        let store = Store::open(config).unwrap();
+        // A previously accepted hold remains fulfilable after lowering sales.
+        store.reserve_paid_sale_with_ceiling(&first, 30).unwrap();
+        store.activate_paid_sale("first").unwrap();
+        assert!(matches!(
+            store.reserve_paid_sale_with_ceiling(&sale("extra", 2, 1), 60),
+            Err(StoreError::QuotaExceeded)
+        ));
+        expire_writes(&store, "first");
+        assert!(matches!(
+            store.reserve_paid_sale_with_ceiling(&sale("extra", 2, 1), 60),
+            Err(StoreError::QuotaExceeded)
+        ));
+        let mut renewal = sale("renewal", 1, 60);
+        renewal.renews = Some("first".into());
+        store.reserve_paid_sale_with_ceiling(&renewal, 60).unwrap();
+        store.activate_paid_sale("renewal").unwrap();
+    }
+
+    #[test]
+    fn concurrent_seller_holds_respect_ceiling_below_total_quota() {
+        let (_dir, store) = store(1000);
+        let barrier = Arc::new(Barrier::new(2));
+        let threads: Vec<_> = (1..=2)
+            .map(|i| {
+                let s = store.clone();
+                let b = barrier.clone();
+                std::thread::spawn(move || {
+                    b.wait();
+                    s.reserve_paid_sale_with_ceiling(&sale(&format!("sale{i}"), i, 60), 100)
+                })
+            })
+            .collect();
+        let results: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+        assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+    }
+
     #[test]
     fn holds_are_durable_bounded_immutable_and_block_owner_writes() {
         let (_dir, store) = store(100);
