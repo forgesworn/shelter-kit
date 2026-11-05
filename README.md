@@ -17,6 +17,10 @@ are refused. The adapter owns node/card validation and consent; the core never
 resolves the native URL itself. A Tor-only adapter rejects this scheme without
 fallback. Physical acceptance of the native path has not been run.
 
+Version 0.5.2 restores a missing or wrong-sized local file from a deduplicated
+upload or mirror body, after hash verification, instead of answering from the
+index alone.
+
 Wildbloom and Bothy remain separate products because publishing and private
 shelter have different consent and failure modes.  They can use the same core:
 a Wildbloom Node is an owner-first keeper using Tor or direct HTTPS, while Bothy
@@ -109,7 +113,7 @@ moved, not evidence that another machine will retain them.
 
 ```toml
 [dependencies]
-shelter-kit = { git = "https://github.com/forgesworn/shelter-kit", tag = "v0.5.1" }
+shelter-kit = { git = "https://github.com/forgesworn/shelter-kit", tag = "v0.5.2" }
 ```
 
 Create a `Store`, build an `AppState` from a `BlossomConfig`, optionally supply

@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.5.2 - Unreleased
+## 0.5.2 - 2026-11-05
 
 - Restore a missing or wrong-sized local file from a deduplicated upload or
   mirror body instead of answering 200 from the index alone (#20). The body is
