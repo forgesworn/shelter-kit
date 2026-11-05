@@ -9,13 +9,13 @@ transport and user experience; Shelter Kit supplies the unbound Axum router,
 BUD authorisation, streaming content-addressed store, retention policy,
 transport-neutral fetch interface and verified mirror/repair path.
 
-The 0.5.1 candidate restores the joint contract's native `fsl://` mirror
+Version 0.5.1 restores the joint contract's native `fsl://` mirror
 path through an explicitly supplied `BlobFetcher`. HTTP(S) source validation,
 scoped authorisation, quota reservation, hashing and atomic commit remain in
 the core. Credentials, ports, queries, fragments and extra native path segments
 are refused. The adapter owns node/card validation and consent; the core never
 resolves the native URL itself. A Tor-only adapter rejects this scheme without
-fallback. This candidate is not a published release or physical acceptance.
+fallback. Physical acceptance of the native path has not been run.
 
 Wildbloom and Bothy remain separate products because publishing and private
 shelter have different consent and failure modes.  They can use the same core:
@@ -109,7 +109,7 @@ moved, not evidence that another machine will retain them.
 
 ```toml
 [dependencies]
-shelter-kit = { git = "https://github.com/forgesworn/shelter-kit", tag = "v0.5.0" }
+shelter-kit = { git = "https://github.com/forgesworn/shelter-kit", tag = "v0.5.1" }
 ```
 
 Create a `Store`, build an `AppState` from a `BlossomConfig`, optionally supply
