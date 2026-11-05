@@ -15,7 +15,9 @@ scoped authorisation, quota reservation, hashing and atomic commit remain in
 the core. Credentials, ports, queries, fragments and extra native path segments
 are refused. The adapter owns node/card validation and consent; the core never
 resolves the native URL itself. A Tor-only adapter rejects this scheme without
-fallback. Physical acceptance of the native path has not been run.
+fallback. Bothy's two-node loopback test (forgesworn/bothy-node#137) mirrors
+over `fsl://` through real Link sessions, including a lost-copy restore.
+Physical acceptance on separate devices has not been run.
 
 Version 0.5.2 restores a missing or wrong-sized local file from a deduplicated
 upload or mirror body, after hash verification, instead of answering from the
