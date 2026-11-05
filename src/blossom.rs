@@ -2463,13 +2463,15 @@ mod tests {
         let state =
             AppState::with_fetcher(open_store(&directory), test_config(), fetcher.clone()).unwrap();
         let app = router(state.clone());
+        // Since 0.5.0 a valid signer with no owner, friend or paid claim
+        // falls through to the guest tier, which is closed in this config.
         assert_eq!(
             app.clone()
                 .oneshot(native_mirror_request(&hash, unix_time(), 2))
                 .await
                 .unwrap()
                 .status(),
-            StatusCode::UNAUTHORIZED
+            StatusCode::FORBIDDEN
         );
         let mut wrong_hash = native_mirror_request(&hash, unix_time(), 1);
         wrong_hash.headers_mut().insert(
