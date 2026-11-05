@@ -2780,6 +2780,121 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_mirror_restores_a_missing_or_truncated_local_copy() {
+        let directory = tempfile::tempdir().unwrap();
+        let bytes = b"bytes whose local file was lost";
+        let hash = hex::encode(Sha256::digest(bytes));
+        let fetcher = FakeFetcher::serving(bytes);
+        let state =
+            AppState::with_fetcher(open_store(&directory), test_config(), fetcher.clone()).unwrap();
+        let app = router(state.clone());
+        assert_eq!(
+            app.clone()
+                .oneshot(upload_request(1, bytes, unix_time()))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CREATED,
+        );
+        let path = state.store().blob_path(&hash);
+
+        for damage in ["missing", "truncated"] {
+            if damage == "missing" {
+                std::fs::remove_file(&path).unwrap();
+            } else {
+                std::fs::write(&path, &bytes[..4]).unwrap();
+            }
+            assert_eq!(
+                app.clone()
+                    .oneshot(mirror_request(&hash, unix_time()))
+                    .await
+                    .unwrap()
+                    .status(),
+                StatusCode::CREATED,
+                "a {damage} local copy must be restored, not answered from the index",
+            );
+            assert_eq!(
+                download(&app, &hash).await,
+                (StatusCode::OK, Bytes::copy_from_slice(bytes))
+            );
+            assert_eq!(stored_blobs(&app).await, (1, 0));
+            let integrity = state.store().verify_integrity().unwrap();
+            assert!(integrity.missing.is_empty() && integrity.corrupted.is_empty());
+        }
+        // These bodies were read and verified, so the source is now evidence.
+        let sources = state.store().repair_sources(&hash).unwrap();
+        assert_eq!(sources.len(), 1);
+        assert!(sources[0].verified_at.is_some());
+        assert_eq!(fetcher.requests().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_wrong_body_cannot_restore_a_missing_local_copy() {
+        let directory = tempfile::tempdir().unwrap();
+        let bytes = b"the bytes the owner uploaded";
+        let hash = hex::encode(Sha256::digest(bytes));
+        let mut delivered = bytes.to_vec();
+        delivered[0] ^= 0x01;
+        let fetcher = FakeFetcher::with(FakeOutcome::Serve {
+            bytes: delivered,
+            declared_size: bytes.len() as u64,
+            content_type: None,
+        });
+        let state = AppState::with_fetcher(open_store(&directory), test_config(), fetcher).unwrap();
+        let app = router(state.clone());
+        assert_eq!(
+            app.clone()
+                .oneshot(upload_request(1, bytes, unix_time()))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CREATED,
+        );
+        std::fs::remove_file(state.store().blob_path(&hash)).unwrap();
+        assert_eq!(
+            app.clone()
+                .oneshot(mirror_request(&hash, unix_time()))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CONFLICT,
+        );
+        assert_eq!(stored_blobs(&app).await, (1, 0));
+        assert_eq!(download(&app, &hash).await.0, StatusCode::NOT_FOUND);
+        assert!(state.store().repair_sources(&hash).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_upload_restores_a_missing_local_copy() {
+        let directory = tempfile::tempdir().unwrap();
+        let bytes = b"bytes the owner still holds";
+        let hash = hex::encode(Sha256::digest(bytes));
+        let state = AppState::new(open_store(&directory), test_config()).unwrap();
+        let app = router(state.clone());
+        assert_eq!(
+            app.clone()
+                .oneshot(upload_request(1, bytes, unix_time()))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CREATED,
+        );
+        std::fs::remove_file(state.store().blob_path(&hash)).unwrap();
+        assert_eq!(
+            app.clone()
+                .oneshot(upload_request(1, bytes, unix_time()))
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::CREATED,
+        );
+        assert_eq!(
+            download(&app, &hash).await,
+            (StatusCode::OK, Bytes::copy_from_slice(bytes))
+        );
+    }
+
+    #[tokio::test]
     async fn mirror_rejects_bytes_that_do_not_match_the_requested_hash() {
         let directory = tempfile::tempdir().unwrap();
         let expected = b"the bytes the signer authorised";
