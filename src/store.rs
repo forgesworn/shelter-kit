@@ -166,7 +166,8 @@ pub struct RepairReservation {
 #[derive(Debug)]
 struct PendingEviction {
     original_path: PathBuf,
-    tombstone_path: PathBuf,
+    /// `None` when the file was already gone and only the row is removed.
+    tombstone_path: Option<PathBuf>,
     record: EvictionRecord,
 }
 
@@ -187,8 +188,10 @@ impl PendingEvictions {
     fn commit(mut self) {
         self.committed = true;
         for item in &self.items {
-            if let Err(error) = fs::remove_file(&item.tombstone_path) {
-                tracing::warn!(reason = %error, path = %item.tombstone_path.display(), "left an evicted blob tombstone for startup cleanup");
+            if let Some(tombstone_path) = &item.tombstone_path
+                && let Err(error) = fs::remove_file(tombstone_path)
+            {
+                tracing::warn!(reason = %error, path = %tombstone_path.display(), "left an evicted blob tombstone for startup cleanup");
             }
             tracing::info!(
                 hash = %item.record.sha256,
@@ -208,8 +211,9 @@ impl Drop for PendingEvictions {
             return;
         }
         for item in self.items.iter().rev() {
-            if item.tombstone_path.exists()
-                && let Err(error) = fs::rename(&item.tombstone_path, &item.original_path)
+            if let Some(tombstone_path) = &item.tombstone_path
+                && tombstone_path.exists()
+                && let Err(error) = fs::rename(tombstone_path, &item.original_path)
             {
                 tracing::error!(reason = %error, path = %item.original_path.display(), "failed to restore a rolled-back eviction");
             }
@@ -648,7 +652,7 @@ impl Store {
                 fs::rename(&original_path, &tombstone_path)?;
                 pending.items.push(PendingEviction {
                     original_path,
-                    tombstone_path,
+                    tombstone_path: Some(tombstone_path),
                     record: EvictionRecord {
                         sha256: tombstone.hash.clone(),
                         size,
@@ -709,6 +713,34 @@ impl Store {
             .take(ADMISSION_PREFIX_BYTES as u64)
             .read_to_end(&mut prefix)?;
         self.admission_check(prefix.len() as u64).push(&prefix)
+    }
+
+    /// Move a blob file into `tmp` ahead of removing its row, so a failed
+    /// transaction can put it back. A file that is already gone yields
+    /// `None`: there are no bytes left to keep, and refusing to drop the row
+    /// would block every later write that reaps or evicts.
+    fn set_aside(&self, hash: &str, suffix: &str) -> Result<Option<PathBuf>, StoreError> {
+        let aside = self
+            .config
+            .root
+            .join("tmp")
+            .join(format!("{hash}.{}.{suffix}", Uuid::new_v4().simple()));
+        match fs::rename(self.blob_path(hash), &aside) {
+            Ok(()) => Ok(Some(aside)),
+            // Rename also reports NotFound for a missing destination, so
+            // confirm the source really is gone before dropping the row.
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    && !self.blob_path(hash).exists() =>
+            {
+                tracing::warn!(
+                    hash,
+                    "removed the row of a blob whose file was already missing"
+                );
+                Ok(None)
+            }
+            Err(error) => Err(StoreError::Io(error)),
+        }
     }
 
     /// Move verified bytes into place, setting aside any damaged copy so a
@@ -1024,21 +1056,17 @@ impl Store {
         }
 
         let blob_path = self.blob_path(hash);
-        if !blob_path.is_file() {
-            return Err(StoreError::MissingBlob);
-        }
-        let tombstone = self
-            .config
-            .root
-            .join("tmp")
-            .join(format!("{hash}.{}.delete", Uuid::new_v4().simple()));
-        fs::rename(&blob_path, &tombstone)?;
+        let tombstone = self.set_aside(hash, "delete")?;
         transaction.execute("DELETE FROM blobs WHERE hash = ?1", [hash])?;
         if let Err(error) = transaction.commit() {
-            fs::rename(&tombstone, &blob_path)?;
+            if let Some(tombstone) = &tombstone {
+                fs::rename(tombstone, &blob_path)?;
+            }
             return Err(StoreError::Database(error));
         }
-        if let Err(error) = fs::remove_file(&tombstone) {
+        if let Some(tombstone) = tombstone
+            && let Err(error) = fs::remove_file(&tombstone)
+        {
             tracing::warn!(reason = %error, path = %tombstone.display(), "left a deleted blob tombstone for startup cleanup");
         }
         Ok(DeleteOutcome::BlobDeleted)
@@ -1223,15 +1251,7 @@ impl Store {
         let mut removed = PendingEvictions::default();
         for (hash, size) in orphaned {
             let original_path = self.blob_path(&hash);
-            if !original_path.is_file() {
-                return Err(StoreError::MissingBlob);
-            }
-            let tombstone_path = self
-                .config
-                .root
-                .join("tmp")
-                .join(format!("{hash}.{}.evict", Uuid::new_v4().simple()));
-            fs::rename(&original_path, &tombstone_path)?;
+            let tombstone_path = self.set_aside(&hash, "evict")?;
             removed.items.push(PendingEviction {
                 original_path,
                 tombstone_path,
@@ -1326,15 +1346,7 @@ impl Store {
                 break;
             }
             let original_path = self.blob_path(&hash);
-            if !original_path.is_file() {
-                return Err(StoreError::MissingBlob);
-            }
-            let tombstone_path = self
-                .config
-                .root
-                .join("tmp")
-                .join(format!("{hash}.{}.evict", Uuid::new_v4().simple()));
-            fs::rename(&original_path, &tombstone_path)?;
+            let tombstone_path = self.set_aside(&hash, "evict")?;
             let record = EvictionRecord {
                 sha256: hash.clone(),
                 size: u64::try_from(size).map_err(|_| StoreError::IntegerRange)?,
@@ -2986,6 +2998,67 @@ mod tests {
             store.get(&owner_hash).unwrap().unwrap().retention_tier,
             RetentionTier::Owner
         );
+    }
+
+    #[test]
+    fn a_missing_file_on_an_expired_blob_does_not_block_writes() {
+        let (_directory, store) = test_store(1024, 1024);
+        let later = u64::try_from(unix_time().unwrap()).unwrap() + 3600;
+        let expired = store_claim(&store, b"friend bytes", friend_claim("friend", 100, later));
+        store
+            .connection()
+            .unwrap()
+            .execute(
+                "UPDATE claims SET claim_expires_at = 1 WHERE hash = ?1",
+                [&expired],
+            )
+            .unwrap();
+        fs::remove_file(store.blob_path(&expired)).unwrap();
+        // The repair loop reaps first too, so it was blocked as well.
+        assert!(store.repair_candidates().unwrap().is_empty());
+
+        // Every write reaps first, so this failed while the file was missing.
+        let kept = store_claim(&store, b"owner bytes", owner_claim("owner", "text/plain"));
+        assert!(store.get(&expired).unwrap().is_none());
+        assert!(store.get(&kept).unwrap().is_some());
+        assert_eq!(store.stats().unwrap().blobs, 1);
+    }
+
+    #[test]
+    fn guest_eviction_drops_a_row_whose_file_is_already_missing() {
+        let (_directory, store) = test_store(100, 100);
+        let lost_guest = store_claim(&store, &[b'a'; 30], guest_claim("lost-guest"));
+        fs::remove_file(store.blob_path(&lost_guest)).unwrap();
+
+        let owner_bytes = [b'o'; 75];
+        let owner_hash = hex::encode(Sha256::digest(owner_bytes));
+        let UploadStart::Reserved(owner) = store
+            .begin_claimed_upload(
+                &owner_hash,
+                owner_bytes.len() as u64,
+                owner_claim("owner", "audio/mpeg"),
+            )
+            .unwrap()
+        else {
+            panic!("owner bytes must reserve after guest eviction");
+        };
+        fs::write(owner.temp_path(), owner_bytes).unwrap();
+        owner.commit(&owner_hash, owner_bytes.len() as u64).unwrap();
+        assert!(store.get(&lost_guest).unwrap().is_none());
+        assert_eq!(store.stats().unwrap().bytes, 75);
+    }
+
+    #[test]
+    fn deleting_the_last_claim_on_a_missing_file_removes_the_row() {
+        let (_directory, store) = test_store(1024, 1024);
+        let hash = store_claim(&store, b"owned bytes", owner_claim("owner", "text/plain"));
+        fs::remove_file(store.blob_path(&hash)).unwrap();
+        assert!(matches!(
+            store.delete_claim(&hash, "owner"),
+            Ok(DeleteOutcome::BlobDeleted)
+        ));
+        assert!(store.get(&hash).unwrap().is_none());
+        assert_eq!(store.stats().unwrap().blobs, 0);
     }
 
     #[test]

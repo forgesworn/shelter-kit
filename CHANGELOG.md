@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.5.3 - 2026-11-05
+
+- Treat a blob whose local file is already missing as removed when reaping
+  expired claims, evicting guests or deleting the last claim (#38). Each
+  previously returned `MissingBlob`. Reaping runs before every write and
+  before each repair pass, so one unclaimed blob with a lost file blocked
+  every upload, mirror and repair on the node, and a restart did not clear
+  it. The row is now dropped, its size is released and a warning is logged.
+- Deleting the last claim on such a blob now succeeds where it returned 404.
+  No schema or public API change; schema 6 remains in use.
+
 ## 0.5.2 - 2026-11-05
 
 - Restore a missing or wrong-sized local file from a deduplicated upload or
