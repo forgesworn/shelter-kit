@@ -727,7 +727,12 @@ impl Store {
             .join(format!("{hash}.{}.{suffix}", Uuid::new_v4().simple()));
         match fs::rename(self.blob_path(hash), &aside) {
             Ok(()) => Ok(Some(aside)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // Rename also reports NotFound for a missing destination, so
+            // confirm the source really is gone before dropping the row.
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    && !self.blob_path(hash).exists() =>
+            {
                 tracing::warn!(
                     hash,
                     "removed the row of a blob whose file was already missing"
@@ -3009,6 +3014,8 @@ mod tests {
             )
             .unwrap();
         fs::remove_file(store.blob_path(&expired)).unwrap();
+        // The repair loop reaps first too, so it was blocked as well.
+        assert!(store.repair_candidates().unwrap().is_empty());
 
         // Every write reaps first, so this failed while the file was missing.
         let kept = store_claim(&store, b"owner bytes", owner_claim("owner", "text/plain"));
