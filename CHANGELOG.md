@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.5.1 - unreleased
+
+- Restore the joint contract's native `fsl://` mirror path through the
+  explicitly supplied `BlobFetcher`. Source validation, scoped authorisation,
+  quota reservation, hashing and atomic commit remain in the core; native URLs
+  with credentials, ports, queries, fragments or extra path segments are
+  refused before fetching. The core never resolves the native URL itself.
+- Require rustls 0.23.46 and update locked rustls-webpki 0.103.16,
+  webpki-root-certs 1.0.11 and tokio 1.54.1 for RUSTSEC-2026-0346 to 0349,
+  0382, 0383 and 0386.
+- No schema, wire-format or public API change; schema 6 remains in use.
+
 ## 0.5.0 - 2026-10-04
 
 - Add operator-owned paid capacity holds, idempotent activation and renewal;
