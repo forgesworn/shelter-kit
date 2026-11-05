@@ -19,7 +19,8 @@ fallback. Physical acceptance of the native path has not been run.
 
 Version 0.5.2 restores a missing or wrong-sized local file from a deduplicated
 upload or mirror body, after hash verification, instead of answering from the
-index alone.
+index alone. Version 0.5.3 stops a blob whose file is already missing from
+blocking every later write when it is reaped, evicted or deleted.
 
 Wildbloom and Bothy remain separate products because publishing and private
 shelter have different consent and failure modes.  They can use the same core:
@@ -113,7 +114,7 @@ moved, not evidence that another machine will retain them.
 
 ```toml
 [dependencies]
-shelter-kit = { git = "https://github.com/forgesworn/shelter-kit", tag = "v0.5.2" }
+shelter-kit = { git = "https://github.com/forgesworn/shelter-kit", tag = "v0.5.3" }
 ```
 
 Create a `Store`, build an `AppState` from a `BlossomConfig`, optionally supply
