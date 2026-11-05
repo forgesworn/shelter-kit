@@ -9,7 +9,8 @@
   while an intact local copy still never certifies an unread remote body. The
   check is presence and size, not a hash; the integrity scan and repair loop
   still own altered bytes. A tombstone written while the body streams wins.
-- No schema, wire-format or public API change; schema 6 remains in use.
+- No schema or public API change; schema 6 remains in use. Only the status of
+  a restoring write changes, from 200 to 201.
 
 ## 0.5.1 - 2026-11-05
 
