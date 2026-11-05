@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.5.2 - 2026-11-05
+
+- Restore a missing or wrong-sized local file from a deduplicated upload or
+  mirror body instead of answering 200 from the index alone (#20). The body is
+  streamed, hash-verified and installed before the claim is recorded, and the
+  write returns 201. A verified mirror body is recorded as a repair source,
+  while an intact local copy still never certifies an unread remote body. The
+  check is presence and size, not a hash; the integrity scan and repair loop
+  still own altered bytes. A tombstone written while the body streams wins.
+- No schema or public API change; schema 6 remains in use. Only the status of
+  a restoring write changes, from 200 to 201.
+
 ## 0.5.1 - 2026-11-05
 
 - Restore the joint contract's native `fsl://` mirror path through the

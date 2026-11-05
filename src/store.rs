@@ -147,6 +147,9 @@ pub struct UploadReservation {
     expected_size: u64,
     claim: ClaimSpec,
     allow_tombstone_restore: bool,
+    /// The blob row already exists but its local file is missing or the
+    /// wrong size, so commit replaces the bytes without a new reservation.
+    restoring: bool,
     temp_path: PathBuf,
     completed: bool,
 }
@@ -507,7 +510,28 @@ impl Store {
             if stored_size != expected_size {
                 return Err(StoreError::LengthMismatch);
             }
-            self.inspect_path(&self.blob_path(expected_hash))?;
+            let path = self.blob_path(expected_hash);
+            if !local_copy_present(&path, expected_size)? {
+                // The index outlived its bytes. Read and verify this body to
+                // restore them rather than answering from the index alone.
+                // The indexed size is already counted, so nothing is reserved
+                // and the claim waits for the verified commit.
+                enforce_claim_limit(&transaction, &claim, expected_hash, expected_size, now)?;
+                drop(transaction);
+                let id = Uuid::new_v4().simple().to_string();
+                return Ok(UploadStart::Reserved(Box::new(UploadReservation {
+                    store: self.clone(),
+                    temp_path: self.config.root.join("tmp").join(format!("{id}.part")),
+                    id,
+                    expected_hash: expected_hash.to_owned(),
+                    expected_size,
+                    claim,
+                    allow_tombstone_restore,
+                    restoring: true,
+                    completed: false,
+                })));
+            }
+            self.inspect_path(&path)?;
             enforce_claim_limit(&transaction, &claim, expected_hash, expected_size, now)?;
             upsert_claim(&transaction, expected_hash, &claim, now)?;
             if crate::paid::committed_usage(&transaction, now)? > self.quota_bytes() as i64 {
@@ -593,6 +617,7 @@ impl Store {
             expected_size,
             claim,
             allow_tombstone_restore,
+            restoring: false,
             completed: false,
         })))
     }
@@ -684,6 +709,47 @@ impl Store {
             .take(ADMISSION_PREFIX_BYTES as u64)
             .read_to_end(&mut prefix)?;
         self.admission_check(prefix.len() as u64).push(&prefix)
+    }
+
+    /// Move verified bytes into place, setting aside any damaged copy so a
+    /// failed database commit can put it back with [`Store::undo_install`].
+    fn install_verified_copy(
+        &self,
+        temp_path: &Path,
+        hash: &str,
+    ) -> Result<Option<PathBuf>, StoreError> {
+        let destination = self.blob_path(hash);
+        create_private_dir(destination.parent().ok_or(StoreError::InvalidHash)?)?;
+        let displaced = if destination.exists() {
+            let backup = self
+                .config
+                .root
+                .join("tmp")
+                .join(format!("{hash}.{}.corrupt", Uuid::new_v4().simple()));
+            fs::rename(&destination, &backup)?;
+            Some(backup)
+        } else {
+            None
+        };
+        if let Err(error) = fs::rename(temp_path, &destination) {
+            if let Some(backup) = &displaced {
+                let _ = fs::rename(backup, &destination);
+            }
+            return Err(StoreError::Io(error));
+        }
+        if let Err(error) = set_private_file_permissions(&destination) {
+            self.undo_install(hash, displaced);
+            return Err(error);
+        }
+        Ok(displaced)
+    }
+
+    fn undo_install(&self, hash: &str, displaced: Option<PathBuf>) {
+        let destination = self.blob_path(hash);
+        let _ = fs::remove_file(&destination);
+        if let Some(backup) = displaced {
+            let _ = fs::rename(backup, &destination);
+        }
     }
 
     pub fn check_upload(&self, expected_hash: &str, expected_size: u64) -> Result<(), StoreError> {
@@ -1505,37 +1571,14 @@ impl RepairReservation {
             return Err(StoreError::LengthMismatch);
         }
 
-        let destination = self.store.blob_path(&self.expected_hash);
-        let backup = self.store.config.root.join("tmp").join(format!(
-            "{}.{}.corrupt",
-            self.expected_hash,
-            Uuid::new_v4().simple()
-        ));
-        let had_destination = destination.exists();
-        if had_destination {
-            fs::rename(&destination, &backup)?;
-        }
-        if let Err(error) = fs::rename(&self.temp_path, &destination) {
-            if had_destination {
-                let _ = fs::rename(&backup, &destination);
-            }
-            return Err(StoreError::Io(error));
-        }
-        if let Err(error) = set_private_file_permissions(&destination) {
-            let _ = fs::remove_file(&destination);
-            if had_destination {
-                let _ = fs::rename(&backup, &destination);
-            }
-            return Err(error);
-        }
+        let displaced = self
+            .store
+            .install_verified_copy(&self.temp_path, &self.expected_hash)?;
         if let Err(error) = transaction.commit() {
-            let _ = fs::remove_file(&destination);
-            if had_destination {
-                let _ = fs::rename(&backup, &destination);
-            }
+            self.store.undo_install(&self.expected_hash, displaced);
             return Err(StoreError::Database(error));
         }
-        if had_destination {
+        if let Some(backup) = displaced {
             let _ = fs::remove_file(backup);
         }
         self.completed = true;
@@ -1576,6 +1619,9 @@ impl UploadReservation {
             return Err(StoreError::LengthMismatch);
         }
         self.store.inspect_path(&self.temp_path)?;
+        if self.restoring {
+            return self.commit_restore();
+        }
 
         let mut connection = self.store.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1640,6 +1686,47 @@ impl UploadReservation {
             )?;
         }
         transaction.commit()?;
+        self.completed = true;
+        Ok(metadata)
+    }
+
+    /// Put verified bytes back under an existing blob row and record the
+    /// claim, exactly as a deduplicated write would have. A tombstone or
+    /// removal that lands while the body streams wins: there is then no row
+    /// to restore, and an owner cannot clear a takedown this way.
+    fn commit_restore(mut self) -> Result<BlobMetadata, StoreError> {
+        let mut connection = self.store.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        enforce_tombstone(&transaction, &self.expected_hash, false)?;
+        let (_, stored_size, _) = query_blob_row(&transaction, &self.expected_hash)?
+            .ok_or(StoreError::MissingReservation)?;
+        if stored_size != self.expected_size {
+            return Err(StoreError::LengthMismatch);
+        }
+        let now = unix_time()?;
+        enforce_claim_limit(
+            &transaction,
+            &self.claim,
+            &self.expected_hash,
+            self.expected_size,
+            now,
+        )?;
+        upsert_claim(&transaction, &self.expected_hash, &self.claim, now)?;
+        if crate::paid::committed_usage(&transaction, now)? > self.store.quota_bytes() as i64 {
+            return Err(StoreError::QuotaExceeded);
+        }
+        let metadata =
+            query_blob(&transaction, &self.expected_hash)?.ok_or(StoreError::MissingBlob)?;
+        let displaced = self
+            .store
+            .install_verified_copy(&self.temp_path, &self.expected_hash)?;
+        if let Err(error) = transaction.commit() {
+            self.store.undo_install(&self.expected_hash, displaced);
+            return Err(StoreError::Database(error));
+        }
+        if let Some(backup) = displaced {
+            let _ = fs::remove_file(backup);
+        }
         self.completed = true;
         Ok(metadata)
     }
@@ -1932,6 +2019,16 @@ pub(crate) fn unix_time() -> Result<i64, StoreError> {
         .map_err(|error| StoreError::Io(std::io::Error::other(error)))?
         .as_secs();
     i64::try_from(seconds).map_err(|_| StoreError::IntegerRange)
+}
+
+/// A size check, not a hash: the integrity scan and repair loop own bit rot,
+/// and hashing here would hold the write transaction for the whole read.
+fn local_copy_present(path: &Path, size: u64) -> Result<bool, StoreError> {
+    match fs::metadata(path) {
+        Ok(metadata) => Ok(metadata.is_file() && metadata.len() == size),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(StoreError::Io(error)),
+    }
 }
 
 fn create_private_dir(path: &Path) -> Result<(), StoreError> {
@@ -2492,6 +2589,114 @@ mod tests {
             .unwrap();
         assert!(matches!(existing, UploadStart::Existing(_)));
         assert_eq!(store.stats().unwrap().bytes, 5);
+    }
+
+    #[test]
+    fn an_indexed_blob_without_its_local_bytes_reserves_a_restore() {
+        let (_directory, store) = test_store(1024, 1024);
+        let hash = "b".repeat(64);
+        let UploadStart::Reserved(reservation) = store
+            .begin_upload(&hash, 5, "01".repeat(32).as_str(), "text/plain")
+            .unwrap()
+        else {
+            panic!("first upload must reserve space");
+        };
+        fs::File::create(reservation.temp_path())
+            .unwrap()
+            .write_all(b"hello")
+            .unwrap();
+        reservation.commit(&hash, 5).unwrap();
+        let path = store.blob_path(&hash);
+
+        for damage in ["missing", "truncated"] {
+            if damage == "missing" {
+                fs::remove_file(&path).unwrap();
+            } else {
+                fs::write(&path, b"hel").unwrap();
+            }
+
+            // An abandoned restore records no claim and leaves the damage.
+            let abandoned = "03".repeat(32);
+            let UploadStart::Reserved(restore) = store
+                .begin_claimed_mirror(&hash, 5, guest_claim(&abandoned))
+                .unwrap()
+            else {
+                panic!("a {damage} local copy must not answer from the index");
+            };
+            drop(restore);
+            assert!(store.list_claims(&abandoned, None, 10).unwrap().is_empty());
+            assert_eq!(
+                fs::read(&path).ok(),
+                (damage == "truncated").then(|| b"hel".to_vec())
+            );
+
+            let mirror_signer = "02".repeat(32);
+            let UploadStart::Reserved(restore) = store
+                .begin_claimed_mirror(&hash, 5, guest_claim(&mirror_signer))
+                .unwrap()
+            else {
+                panic!("a {damage} local copy must not answer from the index");
+            };
+            // The indexed bytes are already counted, so nothing more is reserved.
+            let stats = store.stats().unwrap();
+            assert_eq!((stats.bytes, stats.reserved_bytes), (5, 0));
+            fs::File::create(restore.temp_path())
+                .unwrap()
+                .write_all(b"hello")
+                .unwrap();
+            assert_eq!(restore.commit(&hash, 5).unwrap().size, 5);
+            assert_eq!(fs::read(&path).unwrap(), b"hello");
+            assert_eq!(store.stats().unwrap().bytes, 5);
+            assert_eq!(
+                store.list_claims(&mirror_signer, None, 10).unwrap().len(),
+                1
+            );
+            assert!(matches!(
+                store
+                    .begin_claimed_mirror(&hash, 5, guest_claim(&mirror_signer))
+                    .unwrap(),
+                UploadStart::Existing(_)
+            ));
+        }
+    }
+
+    #[test]
+    fn a_restore_cannot_outlive_a_tombstone_written_while_it_streams() {
+        let (_directory, store) = test_store(1024, 1024);
+        let hash = "c".repeat(64);
+        let owner = "01".repeat(32);
+        let UploadStart::Reserved(reservation) =
+            store.begin_upload(&hash, 5, &owner, "text/plain").unwrap()
+        else {
+            panic!("first upload must reserve space");
+        };
+        fs::File::create(reservation.temp_path())
+            .unwrap()
+            .write_all(b"hello")
+            .unwrap();
+        reservation.commit(&hash, 5).unwrap();
+        fs::remove_file(store.blob_path(&hash)).unwrap();
+
+        let UploadStart::Reserved(restore) = store
+            .begin_claimed_upload(&hash, 5, owner_claim(&owner, "text/plain"))
+            .unwrap()
+        else {
+            panic!("a missing local copy must not answer from the index");
+        };
+        store
+            .write_tombstone(&Tombstone {
+                hash: hash.clone(),
+                signer_pubkey: "04".repeat(32),
+                created_at: 1,
+            })
+            .unwrap();
+        fs::File::create(restore.temp_path())
+            .unwrap()
+            .write_all(b"hello")
+            .unwrap();
+        assert!(restore.commit(&hash, 5).is_err());
+        assert!(!store.blob_path(&hash).exists());
+        assert!(store.tombstone(&hash).unwrap().is_some());
     }
 
     #[test]

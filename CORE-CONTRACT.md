@@ -34,6 +34,11 @@ interrupted writes release their reservation and never become claims.
 
 Physical bytes are deduplicated by digest.  Claims are not: each signer retains
 their own class, declaration and deletion authority over the shared blob.
+A deduplicated write answers from the index only while the local file is
+present at its recorded size.  Otherwise the upload or mirror body is streamed,
+verified and installed in place of the missing or damaged copy before the claim
+is recorded.  This is a presence and size check, not a hash; the integrity scan
+and repair loop remain responsible for detecting altered bytes.
 
 ## Retention classes
 
