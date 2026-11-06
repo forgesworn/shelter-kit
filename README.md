@@ -29,6 +29,8 @@ shelter have different consent and failure modes.  They can use the same core:
 a Wildbloom Node is an owner-first keeper using Tor or direct HTTPS, while Bothy
 can add its own pairing, federation and native transport around the same store
 and router.
+How the core sits between those products and ForgeSworn Link, interface by
+interface, is in [docs/ECOSYSTEM.md](docs/ECOSYSTEM.md).
 
 ## Implemented in 0.1.1
 

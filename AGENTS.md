@@ -51,6 +51,7 @@ src/
 | `CORE-CONTRACT-0.2.md`, `CORE-CONTRACT-0.3.md` | Joint contracts for earlier minor versions |
 | `CHANGELOG.md` | Version history |
 | `SECURITY.md` | Vulnerability reporting |
+| `docs/ECOSYSTEM.md` | Where the crate sits between its consumers and ForgeSworn Link |
 
 ## Common Pitfalls
 

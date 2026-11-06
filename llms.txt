@@ -17,7 +17,7 @@ publishing and private shelter have different consent and failure modes.
 
 ```toml
 [dependencies]
-shelter-kit = { git = "https://github.com/forgesworn/shelter-kit", tag = "v0.4.1" }
+shelter-kit = { git = "https://github.com/forgesworn/shelter-kit", tag = "v0.5.3" }
 ```
 
 ```rust
@@ -63,3 +63,4 @@ Mount `app` into the product's own listener.
 - Full runtime policy and quota semantics: [README.md](README.md#runtime-policy)
 - Compatibility promise: [CORE-CONTRACT.md](CORE-CONTRACT.md)
 - Version history: [CHANGELOG.md](CHANGELOG.md)
+- Where it sits between Wildbloom Node, Bothy Node and ForgeSworn Link: [docs/ECOSYSTEM.md](docs/ECOSYSTEM.md)
