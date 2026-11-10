@@ -24,6 +24,11 @@ upload or mirror body, after hash verification, instead of answering from the
 index alone. Version 0.5.3 stops a blob whose file is already missing from
 blocking every later write when it is reaped, evicted or deleted.
 
+Version 0.6.0 moves to `rusqlite` 0.41 and its bundled SQLite 3.54 for
+RUSTSEC-2026-0459. A build links only one bundled SQLite, so a product that
+also depends on `rusqlite` must move to 0.41 at the same time. The minimum
+Rust version is 1.89.
+
 Wildbloom and Bothy remain separate products because publishing and private
 shelter have different consent and failure modes.  They can use the same core:
 a Wildbloom Node is an owner-first keeper using Tor or direct HTTPS, while Bothy
@@ -116,7 +121,7 @@ moved, not evidence that another machine will retain them.
 
 ```toml
 [dependencies]
-shelter-kit = { git = "https://github.com/forgesworn/shelter-kit", tag = "v0.5.3" }
+shelter-kit = { git = "https://github.com/forgesworn/shelter-kit", tag = "v0.6.0" }
 ```
 
 Create a `Store`, build an `AppState` from a `BlossomConfig`, optionally supply

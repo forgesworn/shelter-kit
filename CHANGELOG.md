@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.6.0 - 2026-11-10
+
+- Move to `rusqlite` 0.41.1 and its bundled SQLite 3.54 for RUSTSEC-2026-0459.
+  SQLite before 3.54.0 can return uninitialised page-cache memory when a
+  database is opened together with a `-wal` file whose page size differs.
+- `StoreError::Database` carries `rusqlite::Error`, so this release is
+  breaking: a consumer that also links `rusqlite` must move to 0.41 in the
+  same change, since a build links only one bundled SQLite.
+- The minimum supported Rust version is now 1.89, as `rusqlite` 0.41 requires.
+- No schema or wire-format change; schema 6 remains in use and existing
+  stores open without migration.
+
 ## 0.5.3 - 2026-11-05
 
 - Treat a blob whose local file is already missing as removed when reaping

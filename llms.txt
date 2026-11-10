@@ -17,7 +17,7 @@ publishing and private shelter have different consent and failure modes.
 
 ```toml
 [dependencies]
-shelter-kit = { git = "https://github.com/forgesworn/shelter-kit", tag = "v0.4.1" }
+shelter-kit = { git = "https://github.com/forgesworn/shelter-kit", tag = "v0.6.0" }
 ```
 
 ```rust
