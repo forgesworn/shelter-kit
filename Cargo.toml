@@ -1,9 +1,9 @@
 [package]
 name = "shelter-kit"
 description = "Transport-neutral Blossom storage, retention and repair core"
-version = "0.5.3"
+version = "0.6.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 license = "MIT"
 authors = ["ForgeSworn"]
 repository = "https://github.com/forgesworn/shelter-kit"
@@ -21,7 +21,7 @@ hex = "0.4.3"
 http = "1.3.1"
 nostr = { version = "0.45.3", features = ["os-rng"] }
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls-no-provider", "json", "stream", "socks"] }
-rusqlite = { version = "0.40.0", features = ["bundled"] }
+rusqlite = { version = "0.41.1", features = ["bundled"] }
 # One TLS provider per process: reqwest is built provider-less and the fetch
 # adapters install ring, so a node that also links ring via quinn/rustls (the
 # ForgeSworn Link stack) carries exactly one backend.  Joint ledger finding 15.
