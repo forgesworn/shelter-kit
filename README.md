@@ -29,6 +29,11 @@ RUSTSEC-2026-0459. A build links only one bundled SQLite, so a product that
 also depends on `rusqlite` must move to 0.41 at the same time. The minimum
 Rust version is 1.89.
 
+Version 0.6.1 forces HTML, XML and `+xml` blobs (including SVG and XHTML)
+to download as opaque attachments even when an owner uploaded them. Every
+successful blob response has `nosniff`; passive owner media keeps its MIME
+type, and file bytes, hashes, descriptors, HEAD and byte ranges are unchanged.
+
 Wildbloom and Bothy remain separate products because publishing and private
 shelter have different consent and failure modes.  They can use the same core:
 a Wildbloom Node is an owner-first keeper using Tor or direct HTTPS, while Bothy
