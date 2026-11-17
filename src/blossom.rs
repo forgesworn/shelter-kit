@@ -1315,21 +1315,27 @@ async fn serve_blob(
         Body::from_stream(ReaderStream::new(file.take(response_size)))
     };
 
-    let opaque = metadata.opaque;
+    // Even an owner's declaration must not turn the storage origin into an
+    // executable document host. Keep the recorded declaration for descriptors.
+    let opaque = metadata.opaque || active_document_type(&metadata.content_type);
+    let content_type = if opaque {
+        "application/octet-stream"
+    } else {
+        &metadata.content_type
+    };
     let mut response = Response::builder()
         .status(status)
-        .header(CONTENT_TYPE, metadata.content_type)
+        .header(CONTENT_TYPE, content_type)
+        .header(&X_CONTENT_TYPE_OPTIONS, "nosniff")
         .header(CONTENT_LENGTH, response_size)
         .header(ACCEPT_RANGES, "bytes")
         .header(CACHE_CONTROL, "public, max-age=31536000, immutable")
         .header(ETAG, format!("\"{}\"", metadata.sha256));
     if opaque {
-        response = response
-            .header(
-                CONTENT_DISPOSITION,
-                format!("attachment; filename=\"{}.bin\"", metadata.sha256),
-            )
-            .header(&X_CONTENT_TYPE_OPTIONS, "nosniff");
+        response = response.header(
+            CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{}.bin\"", metadata.sha256),
+        );
     }
     if status == StatusCode::PARTIAL_CONTENT {
         response = response.header(
@@ -1338,6 +1344,15 @@ async fn serve_blob(
         );
     }
     response.body(body).map_err(|_| ApiError::internal())
+}
+
+fn active_document_type(content_type: &str) -> bool {
+    let essence = content_type.split(';').next().unwrap_or_default().trim();
+    let essence = essence.to_ascii_lowercase();
+    matches!(
+        essence.as_str(),
+        "text/html" | "text/xml" | "application/xml"
+    ) || essence.ends_with("+xml")
 }
 
 /// The blob hash a non-HTTP lane source names: the last path segment before
@@ -2176,6 +2191,123 @@ mod tests {
             open_shelter: false,
             max_concurrent_writes: 4,
             mirror_proxy: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn owner_active_content_downloads_without_changing_bytes_or_range_support() {
+        for content_type in [
+            "text/html",
+            "Text/HTML; charset=utf-8",
+            "application/xhtml+xml",
+            "image/svg+xml",
+            "text/xml; charset=utf-8",
+            "application/xml",
+            "application/rss+xml",
+            "application/xslt+xml",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let bytes = b"<!--ftypavif--><svg xmlns=\"http://www.w3.org/2000/svg\"></svg>";
+            let hash = hex::encode(Sha256::digest(bytes));
+            let state = AppState::new(open_store(&directory), test_config()).unwrap();
+            let app = router(state);
+            let upload = Request::builder()
+                .method(Method::PUT)
+                .uri("/upload")
+                .header(CONTENT_TYPE, content_type)
+                .header(CONTENT_LENGTH, bytes.len())
+                .header(&X_SHA_256, &hash)
+                .header(AUTHORIZATION, upload_authorization(&hash, unix_time()))
+                .body(Body::from(bytes.as_slice()))
+                .unwrap();
+            assert_eq!(
+                app.clone().oneshot(upload).await.unwrap().status(),
+                StatusCode::CREATED
+            );
+            for (method, range, expected_status, expected_bytes) in [
+                (Method::GET, None, StatusCode::OK, bytes.as_slice()),
+                (Method::HEAD, None, StatusCode::OK, b"".as_slice()),
+                (
+                    Method::GET,
+                    Some("bytes=0-13"),
+                    StatusCode::PARTIAL_CONTENT,
+                    &bytes[..14],
+                ),
+            ] {
+                // The suffix is untrusted and must not override the stored MIME policy.
+                let mut request = Request::builder()
+                    .method(method)
+                    .uri(format!("/{hash}.avif"));
+                if let Some(range) = range {
+                    request = request.header(RANGE, range);
+                }
+                let response = app
+                    .clone()
+                    .oneshot(request.body(Body::empty()).unwrap())
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), expected_status);
+                assert_eq!(
+                    response.headers()[CONTENT_TYPE],
+                    "application/octet-stream",
+                    "{content_type}"
+                );
+                assert_eq!(response.headers()[&X_CONTENT_TYPE_OPTIONS], "nosniff");
+                assert_eq!(
+                    response.headers()[CONTENT_DISPOSITION],
+                    format!("attachment; filename=\"{hash}.bin\"")
+                );
+                assert_eq!(response.headers()[ACCEPT_RANGES], "bytes");
+                assert_eq!(response.headers()[ETAG], format!("\"{hash}\""));
+                assert_eq!(
+                    response.into_body().collect().await.unwrap().to_bytes(),
+                    expected_bytes
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn owner_passive_content_keeps_its_mime_type_and_gets_nosniff() {
+        for content_type in [
+            "image/png",
+            "image/avif",
+            "video/mp4",
+            "audio/ogg",
+            "text/plain",
+            "application/octet-stream",
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let bytes = b"unchanged owner bytes";
+            let hash = hex::encode(Sha256::digest(bytes));
+            let store = open_store(&directory);
+            let reservation = match store
+                .begin_upload(&hash, bytes.len() as u64, &pubkey_for(1), content_type)
+                .unwrap()
+            {
+                UploadStart::Reserved(reservation) => reservation,
+                _ => panic!("fresh blob must reserve storage"),
+            };
+            std::fs::write(reservation.temp_path(), bytes).unwrap();
+            reservation.commit(&hash, bytes.len() as u64).unwrap();
+            let app = router(AppState::new(store, test_config()).unwrap());
+            let response = app
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/{hash}.html"))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(response.headers()[CONTENT_TYPE], content_type);
+            assert_eq!(response.headers()[&X_CONTENT_TYPE_OPTIONS], "nosniff");
+            assert!(!response.headers().contains_key(CONTENT_DISPOSITION));
+            assert_eq!(
+                response.into_body().collect().await.unwrap().to_bytes(),
+                bytes.as_slice()
+            );
         }
     }
 

@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.6.1 - 2026-11-17
+
+- Serve owner-declared HTML, XML and `+xml` types (including SVG and XHTML)
+  as opaque attachments, and add `nosniff` to every successful blob response.
+  File extensions cannot override this policy. Stored bytes, MIME declarations,
+  hashes, descriptors, HEAD and byte ranges remain compatible; passive owner
+  media retains its MIME type for playback. No schema or public API change.
+
 ## 0.6.0 - 2026-11-10
 
 - Move to `rusqlite` 0.41.1 and its bundled SQLite 3.54 for RUSTSEC-2026-0459.

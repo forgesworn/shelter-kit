@@ -55,10 +55,13 @@ it does not silently preserve a promise that no longer exists.
 
 ## Serving
 
-Owner declarations may supply a safe content type.  A blob with only friend or
-guest claims is served as `application/octet-stream` with attachment and
-`nosniff`.  Conflicting owner declarations also fail opaque.  A transport never
-chooses or promotes a retention class.
+Every successful blob GET, HEAD and byte-range response carries `nosniff`.
+Owner declarations may supply a passive content type. HTML, XML and any
+`+xml` type (including SVG and XHTML), compared without case or parameters,
+are served as `application/octet-stream` attachments even for owners. A blob
+with only friend, paid or guest claims, and conflicting owner declarations,
+also fails opaque. Stored declarations, descriptors, hashes and file bytes
+remain unchanged. A transport never chooses or promotes a retention class.
 
 ## Mirror and repair
 
